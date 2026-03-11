@@ -1,0 +1,79 @@
+name: Build OpenWrt 14.07-mtk
+
+# 触发方式：手动触发（核心）+ 推送触发（可选）
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main, master ]
+
+# 并发控制：防止多任务同时编译
+concurrency:
+  group: ${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write  # 允许创建Release
+      packages: write
+
+    steps:
+      # 新增步骤：获取当前时间（解决run_at无效问题）
+      - name: Get current time
+        id: date
+        run: |
+          # 生成易读的时间格式：年-月-日 时:分:秒（UTC+8）
+          echo "now=$(date +'%Y-%m-%d %H:%M:%S' --utc '+8 hours')" >> $GITHUB_OUTPUT
+
+      # 步骤1：拉取仓库代码
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # 拉取完整仓库历史
+
+      # 步骤2：在Ubuntu 14.04容器中编译（核心）
+      - name: Build OpenWrt in Ubuntu 14.04 container
+        run: |
+          docker run -v ${{ github.workspace }}:/openwrt --name openwrt-build ubuntu:14.04 /bin/bash -c "
+            # 替换Ubuntu 14.04源（官方源已归档）
+            sed -i 's/archive.ubuntu.com/old-releases.ubuntu.com/g' /etc/apt/sources.list && \
+            apt-get update -y && \
+            # 安装编译依赖（严格匹配README）
+            apt-get install -y build-essential subversion libncurses5-dev zlib1g-dev gawk gcc-multilib flex git-core gettext libssl-dev unzip && \
+            # 进入源码目录
+            cd /openwrt && \
+            # 更新并安装feeds
+            ./scripts/feeds update -a && \
+            ./scripts/feeds install -a && \
+            # 加载配置（自定义.config需替换此步）
+            make defconfig && \
+            # 编译（-j2适配2核资源，V=s显示详细日志）
+            make -j2 V=s && \
+            # 复制产物到容器外
+            cp -r bin /openwrt/
+          "
+
+      # 步骤3：上传临时产物（Artifacts，保留30天）
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: openwrt-14.07-mtk-bin
+          path: ${{ github.workspace }}/bin/
+          retention-days: 30
+
+      # 步骤4：创建Release（永久保存，修复时间变量）
+      - name: Create Release
+        if: success()  # 仅编译成功时执行
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: openwrt-14.07-mtk-${{ github.run_id }}
+          name: OpenWrt 14.07-mtk 编译产物-${{ github.run_id }}
+          files: ${{ github.workspace }}/bin/**/*
+          body: |
+             OpenWrt 14.07-mtk 编译产物
+             编译时间（UTC+8）：${{ steps.date.outputs.now }}
+             触发方式：${{ github.event_name }}
+             运行ID：${{ github.run_id }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}  # GitHub自动生成，无需配置
