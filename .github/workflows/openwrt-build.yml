@@ -1,79 +1,74 @@
 name: Build OpenWrt 14.07-mtk
 
-# 触发方式：手动触发（核心）+ 推送触发（可选）
 on:
-  workflow_dispatch:
   push:
-    branches: [ main, master ]
-
-# 并发控制：防止多任务同时编译
-concurrency:
-  group: ${{ github.ref }}
-  cancel-in-progress: true
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:  # 手动触发
 
 jobs:
   build:
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write  # 允许创建Release
-      packages: write
-
+    runs-on: ubuntu-latest  # 使用GitHub托管的Ubuntu最新版
+    
     steps:
-      # 新增步骤：获取当前时间（解决run_at无效问题）
-      - name: Get current time
-        id: date
-        run: |
-          # 生成易读的时间格式：年-月-日 时:分:秒（UTC+8）
-          echo "now=$(date +'%Y-%m-%d %H:%M:%S' --utc '+8 hours')" >> $GITHUB_OUTPUT
+    - name: Checkout source code
+      uses: actions/checkout@v4
+      with:
+        path: openwrt-14.07-mtk  # 源码检出到指定目录
 
-      # 步骤1：拉取仓库代码
-      - name: Checkout code
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0  # 拉取完整仓库历史
-
-      # 步骤2：在Ubuntu 14.04容器中编译（核心）
-      - name: Build OpenWrt in Ubuntu 14.04 container
-        run: |
-          docker run -v ${{ github.workspace }}:/openwrt --name openwrt-build ubuntu:14.04 /bin/bash -c "
-            # 替换Ubuntu 14.04源（官方源已归档）
-            sed -i 's/archive.ubuntu.com/old-releases.ubuntu.com/g' /etc/apt/sources.list && \
-            apt-get update -y && \
-            # 安装编译依赖（严格匹配README）
-            apt-get install -y build-essential subversion libncurses5-dev zlib1g-dev gawk gcc-multilib flex git-core gettext libssl-dev unzip && \
-            # 进入源码目录
-            cd /openwrt && \
-            # 更新并安装feeds
-            ./scripts/feeds update -a && \
-            ./scripts/feeds install -a && \
-            # 加载配置（自定义.config需替换此步）
-            make defconfig && \
-            # 编译（-j2适配2核资源，V=s显示详细日志）
-            make -j2 V=s && \
-            # 复制产物到容器外
-            cp -r bin /openwrt/
+    - name: Build OpenWrt in Ubuntu 14.04 container
+      run: |
+        # 启动Ubuntu 14.04容器，挂载源码目录，修复源并编译
+        docker run -e TZ=Asia/Shanghai \
+          -v ${{ github.workspace }}/openwrt-14.07-mtk:/openwrt \
+          --name openwrt-build ubuntu:14.04 /bin/bash -c "
+            # 核心修复：替换为Ubuntu 14.04专属归档源
+            echo 'deb http://old-releases.ubuntu.com/ubuntu-archive/ trusty main restricted universe multiverse' > /etc/apt/sources.list
+            echo 'deb http://old-releases.ubuntu.com/ubuntu-archive/ trusty-updates main restricted universe multiverse' >> /etc/apt/sources.list
+            echo 'deb http://old-releases.ubuntu.com/ubuntu-archive/ trusty-backports main restricted universe multiverse' >> /etc/apt/sources.list
+            echo 'deb http://old-releases.ubuntu.com/ubuntu-archive/ trusty-security main restricted universe multiverse' >> /etc/apt/sources.list
+            
+            # 更新源（失败后重试一次）
+            apt-get update -y || apt-get update -y
+            
+            # 安装OpenWrt 14.07编译依赖（根据实际需求调整）
+            apt-get install -y --no-install-recommends \
+              build-essential subversion libncurses5-dev zlib1g-dev \
+              gawk gcc-multilib flex git-core gettext libssl-dev unzip \
+              wget curl python2.7 sudo
+            
+            # 进入源码目录，执行编译流程
+            cd /openwrt
+            ./scripts/feeds update -a
+            ./scripts/feeds install -a
+            make defconfig  # 生成默认配置
+            make -j$(nproc) V=s  # 多核编译（nproc自动识别核心数）
           "
 
-      # 步骤3：上传临时产物（Artifacts，保留30天）
-      - name: Upload build artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: openwrt-14.07-mtk-bin
-          path: ${{ github.workspace }}/bin/
-          retention-days: 30
+    - name: Copy build artifacts
+      run: |
+        # 从容器中复制编译产物到宿主目录
+        docker cp openwrt-build:/openwrt/bin ${{ github.workspace }}/openwrt-bin
+        # 清理容器
+        docker rm -f openwrt-build
 
-      # 步骤4：创建Release（永久保存，修复时间变量）
-      - name: Create Release
-        if: success()  # 仅编译成功时执行
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: openwrt-14.07-mtk-${{ github.run_id }}
-          name: OpenWrt 14.07-mtk 编译产物-${{ github.run_id }}
-          files: ${{ github.workspace }}/bin/**/*
-          body: |
-             OpenWrt 14.07-mtk 编译产物
-             编译时间（UTC+8）：${{ steps.date.outputs.now }}
-             触发方式：${{ github.event_name }}
-             运行ID：${{ github.run_id }}
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}  # GitHub自动生成，无需配置
+    - name: Upload build artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: openwrt-14.07-mtk-bin
+        path: ${{ github.workspace }}/openwrt-bin
+
+    - name: Create GitHub Release (optional)
+      if: github.ref == 'refs/heads/main'  # 仅主分支触发
+      uses: softprops/action-gh-release@v2
+      with:
+        files: ${{ github.workspace }}/openwrt-bin/**/*
+        tag_name: build-${{ github.run_id }}
+        name: OpenWrt 14.07-mtk Build ${{ github.run_id }}
+        body: |
+          Automated build from GitHub Actions
+          Runner: ${{ runner.os }} ${{ runner.version }}
+          Build ID: ${{ github.run_id }}
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
