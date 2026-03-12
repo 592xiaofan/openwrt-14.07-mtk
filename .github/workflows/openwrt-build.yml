@@ -38,42 +38,49 @@ jobs:
 
             su - openwrt -c '
               cd /openwrt
-
-              cat > .config <<- "EOF"
+              
+              # 创建配置文件
+              cat > .config << \"EOF\"
               CONFIG_TARGET_ramips=y
               CONFIG_TARGET_ramips_rt305x=y
               CONFIG_CPU_MIPSR2_IRQ_VI=y
               CONFIG_KERNEL_BRIDGE=y
               CONFIG_KERNEL_VLAN_8021Q=y
-
+              
+              # 设置串口波特率为115200
+              CONFIG_TARGET_ramips_rt305x_DEVICE_BAUDRATE=115200
+              CONFIG_KERNEL_EARLY_PRINTK=y
+              CONFIG_KERNEL_CMDLINE_OVERRIDE=y
+              
               CONFIG_PACKAGE_dnsmasq=y
               CONFIG_PACKAGE_iptables=y
               CONFIG_PACKAGE_iptables-mod-nat=y
-
+              
               CONFIG_PACKAGE_kmod-rt2800-soc=y
               CONFIG_PACKAGE_wpad-mini=y
               CONFIG_PACKAGE_hostapd-mini=y
-
+              
               CONFIG_PACKAGE_kmod-usb-core=y
               CONFIG_PACKAGE_kmod-usb-ohci=y
               CONFIG_PACKAGE_kmod-usb-storage=y
-
+              
               CONFIG_PACKAGE_kmod-sdio=y
               CONFIG_PACKAGE_kmod-mmc=y
-
+              
               CONFIG_PACKAGE_kmod-tun=y
-
+              
               CONFIG_PACKAGE_kmod-sched=y
               CONFIG_PACKAGE_luci-app-qos=y
-
+              
               CONFIG_PACKAGE_ddns-scripts=y
               CONFIG_PACKAGE_luci-app-ddns=y
-
+              
               CONFIG_PACKAGE_luci=y
               CONFIG_PACKAGE_luci-mod-admin-full=y
               CONFIG_PACKAGE_luci-mod-network=y
               CONFIG_PACKAGE_luci-mod-wireless=y
-
+              
+              # 禁用不需要的功能
               CONFIG_PACKAGE_ipv6=n
               CONFIG_PACKAGE_kmod-ipv6=n
               CONFIG_PACKAGE_samba36=n
@@ -81,38 +88,61 @@ jobs:
               CONFIG_DEVEL=n
               EOF
 
-              ./scripts/feeds update -a || ./scripts/feeds update -a
+              # 显示配置以便调试
+              echo \"========== .config content ==========\"
+              cat .config
+              echo \"=====================================\"
+
+              ./scripts/feeds update -a
               ./scripts/feeds install -a
 
               make defconfig FORCE=1
-              make -j1 V=s FORCE=1
+              make -j\$(nproc) V=s FORCE=1
             '
 
-            # 修复：创建目标目录并正确复制文件
-            mkdir -p /openwrt/artifacts
-            cp -rf /openwrt/bin/* /openwrt/artifacts/ 2>/dev/null || true
-            # 也复制固件输出目录
-            cp -rf /openwrt/bin/ramips /openwrt/artifacts/ 2>/dev/null || true
+            # 在容器内创建输出目录并复制文件
+            mkdir -p /openwrt/output
+            cp -rf /openwrt/bin/* /openwrt/output/ 2>/dev/null || true
+            echo \"Files in output directory:\"
+            ls -la /openwrt/output/ || echo \"No files found\"
           "
 
-      - name: Copy artifacts from Docker container
+      - name: Copy artifacts from container
         run: |
-          # 从 Docker 容器中复制文件
-          mkdir -p ${{ github.workspace }}/bin
-          docker cp openwrt-build:/openwrt/artifacts/. ${{ github.workspace }}/bin/ || true
-          docker cp openwrt-build:/openwrt/bin/ramips ${{ github.workspace }}/bin/ 2>/dev/null || true
+          # 创建工作目录（使用 sudo 解决权限问题）
+          sudo mkdir -p ${{ github.workspace }}/bin
+          sudo chown -R $USER:$USER ${{ github.workspace }}/bin
           
-          # 列出找到的文件以便调试
-          echo "Files in bin directory:"
-          ls -la ${{ github.workspace }}/bin/ || echo "bin directory is empty"
+          # 从容器复制文件
+          docker cp openwrt-build:/openwrt/output/. ${{ github.workspace }}/bin/ || echo "No files copied from output"
+          docker cp openwrt-build:/openwrt/bin/ramips ${{ github.workspace }}/bin/ 2>/dev/null || echo "No ramips files found"
+          
+          # 设置正确的权限
+          sudo chown -R $USER:$USER ${{ github.workspace }}/bin
+          
+          # 显示找到的文件
+          echo "=== Files in bin directory ==="
+          find ${{ github.workspace }}/bin -type f -name "*.bin" -o -name "*.trx" -o -name "*.img" | head -20
+          echo "================================"
 
-      - name: Upload artifacts
+      - name: Upload firmware artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: openwrt-firmware
+          name: openwrt-14.07-firmware
           path: |
-            bin/
-            !bin/**/*.o
-            !bin/**/*.d
+            bin/**/*.bin
+            bin/**/*.trx
+            bin/**/*.img
+            bin/**/openwrt-ramips-*
           retention-days: 30
           if-no-files-found: warn
+
+      - name: Upload full build output (for debugging)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs
+          path: |
+            bin/**/*
+            logs/
+          retention-days: 7
