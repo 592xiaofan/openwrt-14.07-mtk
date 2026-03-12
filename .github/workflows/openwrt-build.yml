@@ -2,16 +2,13 @@ name: Build OpenWrt 14.07-mtk for MT7688
 
 on:
   workflow_dispatch:
-  # 也可以添加定时触发
-  # schedule:
-  #   - cron: '0 0 * * 0'  # 每周日构建
 
 jobs:
   build:
     runs-on: ubuntu-latest
     permissions:
       contents: write
-      actions: write  # 允许清理旧缓存
+      actions: write
 
     steps:
       - name: Checkout source
@@ -20,15 +17,10 @@ jobs:
           path: openwrt
           fetch-depth: 1
 
-      - name: 清理旧缓存（避免空间不足）
-        run: |
-          docker system prune -f
-          sudo rm -rf /tmp/*
-          
-      - name: 设置 Docker 镜像加速（解决网络超时）
+      - name: 设置 Docker 镜像加速
         run: |
           sudo mkdir -p /etc/docker
-          sudo tee /etc/docker/daemon.json <<EOF
+          sudo tee /etc/docker/daemon.json <<'EOF'
           {
             "registry-mirrors": [
               "https://docker.mirrors.ustc.edu.cn",
@@ -38,157 +30,162 @@ jobs:
           }
           EOF
           sudo systemctl restart docker || true
+          sleep 5
 
       - name: 在 Ubuntu 12.04 容器中编译
         id: build
         run: |
-          # 带重试机制的 docker run
+          # 创建脚本文件，避免引号嵌套问题
+          cat > build_script.sh << 'EOF_SCRIPT'
+          #!/bin/bash
+          set -ex
+          
+          # 网络重试函数
+          retry() {
+            local n=1
+            local max=3
+            local delay=5
+            while true; do
+              "$@" && break || {
+                if [[ $n -lt $max ]]; then
+                  ((n++))
+                  echo "Command failed. Attempt $n/$max:"
+                  sleep $delay
+                else
+                  echo "The command has failed after $n attempts."
+                  return 1
+                fi
+              }
+            done
+          }
+          
+          # 换源函数
+          update_source() {
+            # 尝试 old-releases 源
+            sed -i 's/archive.ubuntu.com/old-releases.ubuntu.com/g' /etc/apt/sources.list
+            sed -i 's/security.ubuntu.com/old-releases.ubuntu.com/g' /etc/apt/sources.list
+            if retry apt-get update; then
+              return 0
+            fi
+            
+            # 如果失败，尝试 163 源
+            echo "尝试备用源 163..."
+            cat > /etc/apt/sources.list << 'EOF'
+          deb http://mirrors.163.com/ubuntu/ precise main universe restricted multiverse
+          deb http://mirrors.163.com/ubuntu/ precise-security main universe restricted multiverse
+          deb http://mirrors.163.com/ubuntu/ precise-updates main universe restricted multiverse
+          deb http://mirrors.163.com/ubuntu/ precise-backports main universe restricted multiverse
+          EOF
+            retry apt-get update
+          }
+          
+          # 安装依赖
+          install_deps() {
+            retry apt-get install -y build-essential subversion libncurses5-dev zlib1g-dev gawk \
+              gcc-multilib flex git-core gettext libssl-dev unzip python2.7 file wget curl
+          }
+          
+          # 主流程
+          update_source
+          
+          install_deps
+          
+          echo "=== GCC Version ==="
+          gcc --version | head -1
+          
+          cd /openwrt
+          
+          # 重写 feeds.conf
+          cat > feeds.conf << 'EOF'
+          src-git packages https://github.com/openwrt/packages.git^0b0ec2fce2974e6f74a8de342957cba6e186d924
+          src-git luci https://github.com/openwrt/luci.git^79cf66900e038f0d03376edc7033c385030a5222
+          src-git routing https://github.com/openwrt-routing/packages.git^bb289e1f913f4509cb1a61d06f6eeb4c560adcec
+          EOF
+          
+          retry ./scripts/feeds update -a
+          ./scripts/feeds install luci luci-app-qos luci-app-ddns ddns-scripts
+          
+          # 写入 .config
+          cat > .config << 'EOF'
+          CONFIG_TARGET_ramips=y
+          CONFIG_TARGET_ramips_mt76x8=y
+          CONFIG_TARGET_ramips_mt76x8_DEVICE_mt7688=y
+          CONFIG_TARGET_OPTIONS=y
+          CONFIG_TARGET_OPTIONS_BAUDRATE_115200=y
+          CONFIG_KERNEL_BRIDGE=y
+          CONFIG_KERNEL_VLAN_8021Q=y
+          CONFIG_PACKAGE_dnsmasq=y
+          CONFIG_PACKAGE_iptables=y
+          CONFIG_PACKAGE_iptables-mod-nat=y
+          CONFIG_PACKAGE_kmod-rt2800-soc=y
+          CONFIG_PACKAGE_wpad-mini=y
+          CONFIG_PACKAGE_hostapd-mini=y
+          CONFIG_PACKAGE_kmod-usb-core=y
+          CONFIG_PACKAGE_kmod-usb-ohci=y
+          CONFIG_PACKAGE_kmod-usb-storage=y
+          CONFIG_PACKAGE_kmod-usb2=y
+          CONFIG_PACKAGE_kmod-sdio=y
+          CONFIG_PACKAGE_kmod-mmc=y
+          CONFIG_PACKAGE_kmod-tun=y
+          CONFIG_PACKAGE_kmod-sched=y
+          CONFIG_PACKAGE_luci-app-qos=y
+          CONFIG_PACKAGE_ddns-scripts=y
+          CONFIG_PACKAGE_luci-app-ddns=y
+          CONFIG_PACKAGE_luci=y
+          CONFIG_PACKAGE_luci-mod-admin-full=y
+          CONFIG_TARGET_ROOTFS_SQUASHFS=y
+          CONFIG_PACKAGE_ipv6=n
+          CONFIG_PACKAGE_kmod-ipv6=n
+          CONFIG_PACKAGE_samba36=n
+          CONFIG_PACKAGE_miniupnpd=n
+          EOF
+          
+          echo "========== .config =========="
+          cat .config
+          echo "=============================="
+          
+          make defconfig
+          
+          retry make download V=s
+          
+          echo "开始编译，首次编译约 1.5-2 小时..."
+          make -j4 V=s 2>&1 | tee build.log
+          
+          echo "========== Firmware files =========="
+          find bin/ -name '*.bin' -o -name '*.trx' | xargs ls -lh
+          echo "====================================="
+          EOF_SCRIPT
+          
+          # 重试机制运行容器
           for i in {1..3}; do
+            echo "尝试第 $i 次编译..."
+            
+            # 清理旧容器
+            docker rm -f openwrt-build 2>/dev/null || true
+            
+            # 运行容器
             docker run --name openwrt-build \
               --privileged \
               -e TZ=Asia/Shanghai \
               -v ${{ github.workspace }}/openwrt:/openwrt \
-              ubuntu:12.04 /bin/bash -c "
-              set -ex
-              
-              # ========== 网络重试函数 ==========
-              retry() {
-                local n=1
-                local max=3
-                local delay=5
-                while true; do
-                  \"\$@\" && break || {
-                    if [[ \$n -lt \$max ]]; then
-                      ((n++))
-                      echo \"Command failed. Attempt \$n/\$max:\"
-                      sleep \$delay
-                    else
-                      echo \"The command has failed after \$n attempts.\"
-                      return 1
-                    fi
-                  }
-                done
-              }
-              
-              # ========== 换源函数（带自动切换）==========
-              update_source() {
-                # 尝试第一个源
-                sed -i 's/archive.ubuntu.com/old-releases.ubuntu.com/g' /etc/apt/sources.list
-                if retry apt-get update; then
-                  return 0
-                fi
-                
-                # 如果第一个源失败，尝试备用源
-                echo '尝试备用源...'
-                cat > /etc/apt/sources.list << 'EOF_SOURCES'
-              deb http://mirrors.163.com/ubuntu/ precise main universe restricted multiverse
-              deb http://mirrors.163.com/ubuntu/ precise-security main universe restricted multiverse
-              deb http://mirrors.163.com/ubuntu/ precise-updates main universe restricted multiverse
-              deb http://mirrors.163.com/ubuntu/ precise-backports main universe restricted multiverse
-              EOF_SOURCES
-                
-                retry apt-get update
-              }
-              
-              # ========== 安装依赖（带重试）==========
-              install_deps() {
-                retry apt-get install -y build-essential subversion libncurses5-dev zlib1g-dev gawk \\
-                  gcc-multilib flex git-core gettext libssl-dev unzip python2.7 file wget curl
-              }
-              
-              # ========== 主流程 ==========
-              # 1. 更换软件源
-              update_source
-              
-              # 2. 安装编译依赖
-              install_deps
-              
-              # 3. 验证 GCC 版本
-              echo '=== GCC Version ==='
-              gcc --version | head -1
-              
-              # 4. 进入源码目录
-              cd /openwrt
-              
-              # 5. 重写 feeds.conf（只保留核心 feed）
-              cat > feeds.conf << 'EOF_FEEDS'
-              src-git packages https://github.com/openwrt/packages.git^0b0ec2fce2974e6f74a8de342957cba6e186d924
-              src-git luci https://github.com/openwrt/luci.git^79cf66900e038f0d03376edc7033c385030a5222
-              src-git routing https://github.com/openwrt-routing/packages.git^bb289e1f913f4509cb1a61d06f6eeb4c560adcec
-              EOF_FEEDS
-              
-              # 6. 更新 feeds（带重试）
-              retry ./scripts/feeds update -a
-              ./scripts/feeds install luci luci-app-qos luci-app-ddns ddns-scripts
-              
-              # 7. 写入 .config
-              cat > .config << 'EOF_CONFIG'
-              CONFIG_TARGET_ramips=y
-              CONFIG_TARGET_ramips_mt76x8=y
-              CONFIG_TARGET_ramips_mt76x8_DEVICE_mt7688=y
-              CONFIG_TARGET_OPTIONS=y
-              CONFIG_TARGET_OPTIONS_BAUDRATE_115200=y
-              CONFIG_KERNEL_BRIDGE=y
-              CONFIG_KERNEL_VLAN_8021Q=y
-              CONFIG_PACKAGE_dnsmasq=y
-              CONFIG_PACKAGE_iptables=y
-              CONFIG_PACKAGE_iptables-mod-nat=y
-              CONFIG_PACKAGE_kmod-rt2800-soc=y
-              CONFIG_PACKAGE_wpad-mini=y
-              CONFIG_PACKAGE_hostapd-mini=y
-              CONFIG_PACKAGE_kmod-usb-core=y
-              CONFIG_PACKAGE_kmod-usb-ohci=y
-              CONFIG_PACKAGE_kmod-usb-storage=y
-              CONFIG_PACKAGE_kmod-usb2=y
-              CONFIG_PACKAGE_kmod-sdio=y
-              CONFIG_PACKAGE_kmod-mmc=y
-              CONFIG_PACKAGE_kmod-tun=y
-              CONFIG_PACKAGE_kmod-sched=y
-              CONFIG_PACKAGE_luci-app-qos=y
-              CONFIG_PACKAGE_ddns-scripts=y
-              CONFIG_PACKAGE_luci-app-ddns=y
-              CONFIG_PACKAGE_luci=y
-              CONFIG_PACKAGE_luci-mod-admin-full=y
-              CONFIG_TARGET_ROOTFS_SQUASHFS=y
-              CONFIG_PACKAGE_ipv6=n
-              CONFIG_PACKAGE_kmod-ipv6=n
-              CONFIG_PACKAGE_samba36=n
-              CONFIG_PACKAGE_miniupnpd=n
-              EOF_CONFIG
-              
-              echo '========== .config =========='
-              cat .config
-              echo '=============================='
-              
-              # 8. 生成配置
-              make defconfig
-              
-              # 9. 下载源码（带重试）
-              retry make download V=s
-              
-              # 10. 开始编译
-              echo '开始编译，首次编译约 1.5-2 小时...'
-              make -j4 V=s 2>&1 | tee build.log
-              
-              # 11. 检查固件
-              echo '========== Firmware files =========='
-              find bin/ -name '*.bin' -o -name '*.trx' | xargs ls -lh
-              echo '====================================='
-              "
-              
+              -v ${{ github.workspace }}/build_script.sh:/build_script.sh \
+              ubuntu:12.04 /bin/bash /build_script.sh
+            
             if [ $? -eq 0 ]; then
               echo "✅ 编译成功"
               exit 0
             else
-              echo "❌ 第 $i 次尝试失败，正在重试..."
-              docker rm openwrt-build
-              continue
+              echo "❌ 第 $i 次尝试失败"
+              if [ $i -lt 3 ]; then
+                echo "5秒后重试..."
+                sleep 5
+              fi
             fi
           done
           
           echo "所有重试都失败了"
           exit 1
-          
+
       - name: 从容器复制固件
         if: always()
         run: |
@@ -196,12 +193,13 @@ jobs:
           docker cp openwrt-build:/openwrt/bin/. ${{ github.workspace }}/firmware/ 2>/dev/null || echo "No firmware found"
           docker cp openwrt-build:/openwrt/build.log ${{ github.workspace }}/logs/ 2>/dev/null || echo "No build.log"
           docker cp openwrt-build:/openwrt/.config ${{ github.workspace }}/logs/config.txt 2>/dev/null || true
-          sudo chown -R runner:docker ${{ github.workspace }}/firmware ${{ github.workspace }}/logs 2>/dev/null || true
+          # 修复权限
+          sudo chown -R $USER:$USER ${{ github.workspace }}/firmware ${{ github.workspace }}/logs 2>/dev/null || true
 
       - name: 上传固件
         uses: actions/upload-artifact@v4
         with:
-          name: openwrt-14.07-mt7688-firmware
+          name: openwrt-14.07-mt7688-firmware-${{ github.run_id }}
           path: firmware/
           retention-days: 30
           if-no-files-found: warn
@@ -210,12 +208,12 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: build-logs
+          name: build-logs-${{ github.run_id }}
           path: logs/
           retention-days: 30
 
       - name: 清理容器
         if: always()
         run: |
-          docker stop openwrt-build 2>/dev/null || true
-          docker rm openwrt-build 2>/dev/null || true
+          docker rm -f openwrt-build 2>/dev/null || true
+          rm -f build_script.sh
