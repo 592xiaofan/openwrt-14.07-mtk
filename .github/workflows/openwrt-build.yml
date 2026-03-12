@@ -46,22 +46,22 @@ jobs:
             cd /openwrt
 
             # 重写 feeds.conf，只保留必要的 feeds
-            cat > feeds.conf << 'EOF'
+            cat > feeds.conf << 'EOF_feeds'
             src-git packages https://github.com/openwrt/packages.git^0b0ec2fce2974e6f74a8de342957cba6e186d924
             src-git luci https://github.com/openwrt/luci.git^79cf66900e038f0d03376edc7033c385030a5222
             src-git routing https://github.com/openwrt-routing/packages.git^bb289e1f913f4509cb1a61d06f6eeb4c560adcec
             # 注释掉 telephony 和 oldpackages，避免安装无关包
             # src-git telephony https://github.com/openwrt/telephony.git^16a0b1b1eb8c4c3d0d94d4d3140be4fdc6b1b6f2
-            EOF
+            EOF_feeds
 
             # 更新 feeds
             ./scripts/feeds update -a
 
-            # 只安装 luci 及相关包（根据 .config 中启用的包）
+            # 只安装 luci 及相关包
             ./scripts/feeds install luci luci-app-qos luci-app-ddns ddns-scripts
 
-            # 生成 .config 文件（针对 MT7688）
-            cat > .config << 'EOF'
+            # 生成 .config 文件（针对 MT7688）- 使用不同的 EOF 标记
+            cat > .config << 'EOF_config'
             CONFIG_TARGET_ramips=y
             CONFIG_TARGET_ramips_mt76x8=y
             CONFIG_TARGET_ramips_mt76x8_DEVICE_mt7688=y
@@ -93,7 +93,7 @@ jobs:
             CONFIG_PACKAGE_kmod-ipv6=n
             CONFIG_PACKAGE_samba36=n
             CONFIG_PACKAGE_miniupnpd=n
-            EOF
+            EOF_config
 
             echo '========== .config =========='
             cat .config
