@@ -35,7 +35,7 @@ jobs:
       - name: 在 Ubuntu 12.04 容器中编译
         id: build
         run: |
-          # 创建脚本文件，避免引号嵌套问题
+          # 创建编译脚本
           cat > build_script.sh << 'EOF_SCRIPT'
           #!/bin/bash
           set -ex
@@ -85,75 +85,86 @@ jobs:
               gcc-multilib flex git-core gettext libssl-dev unzip python2.7 file wget curl
           }
           
-          # 主流程
+          # 更新源并安装依赖
           update_source
-          
           install_deps
           
           echo "=== GCC Version ==="
           gcc --version | head -1
           
-          cd /openwrt
+          # 创建普通用户（关键修复！）
+          useradd -m openwrt
           
-          # 重写 feeds.conf
-          cat > feeds.conf << 'EOF'
-          src-git packages https://github.com/openwrt/packages.git^0b0ec2fce2974e6f74a8de342957cba6e186d924
-          src-git luci https://github.com/openwrt/luci.git^79cf66900e038f0d03376edc7033c385030a5222
-          src-git routing https://github.com/openwrt-routing/packages.git^bb289e1f913f4509cb1a61d06f6eeb4c560adcec
-          EOF
+          # 设置源码目录权限
+          chown -R openwrt:openwrt /openwrt
           
-          retry ./scripts/feeds update -a
-          ./scripts/feeds install luci luci-app-qos luci-app-ddns ddns-scripts
-          
-          # 写入 .config
-          cat > .config << 'EOF'
-          CONFIG_TARGET_ramips=y
-          CONFIG_TARGET_ramips_mt76x8=y
-          CONFIG_TARGET_ramips_mt76x8_DEVICE_mt7688=y
-          CONFIG_TARGET_OPTIONS=y
-          CONFIG_TARGET_OPTIONS_BAUDRATE_115200=y
-          CONFIG_KERNEL_BRIDGE=y
-          CONFIG_KERNEL_VLAN_8021Q=y
-          CONFIG_PACKAGE_dnsmasq=y
-          CONFIG_PACKAGE_iptables=y
-          CONFIG_PACKAGE_iptables-mod-nat=y
-          CONFIG_PACKAGE_kmod-rt2800-soc=y
-          CONFIG_PACKAGE_wpad-mini=y
-          CONFIG_PACKAGE_hostapd-mini=y
-          CONFIG_PACKAGE_kmod-usb-core=y
-          CONFIG_PACKAGE_kmod-usb-ohci=y
-          CONFIG_PACKAGE_kmod-usb-storage=y
-          CONFIG_PACKAGE_kmod-usb2=y
-          CONFIG_PACKAGE_kmod-sdio=y
-          CONFIG_PACKAGE_kmod-mmc=y
-          CONFIG_PACKAGE_kmod-tun=y
-          CONFIG_PACKAGE_kmod-sched=y
-          CONFIG_PACKAGE_luci-app-qos=y
-          CONFIG_PACKAGE_ddns-scripts=y
-          CONFIG_PACKAGE_luci-app-ddns=y
-          CONFIG_PACKAGE_luci=y
-          CONFIG_PACKAGE_luci-mod-admin-full=y
-          CONFIG_TARGET_ROOTFS_SQUASHFS=y
-          CONFIG_PACKAGE_ipv6=n
-          CONFIG_PACKAGE_kmod-ipv6=n
-          CONFIG_PACKAGE_samba36=n
-          CONFIG_PACKAGE_miniupnpd=n
-          EOF
-          
-          echo "========== .config =========="
-          cat .config
-          echo "=============================="
-          
-          make defconfig
-          
-          retry make download V=s
-          
-          echo "开始编译，首次编译约 1.5-2 小时..."
-          make -j4 V=s 2>&1 | tee build.log
-          
-          echo "========== Firmware files =========="
-          find bin/ -name '*.bin' -o -name '*.trx' | xargs ls -lh
-          echo "====================================="
+          # 切换到普通用户执行编译
+          su - openwrt -c '
+            cd /openwrt
+            
+            # 重写 feeds.conf
+            cat > feeds.conf << "EOF"
+            src-git packages https://github.com/openwrt/packages.git^0b0ec2fce2974e6f74a8de342957cba6e186d924
+            src-git luci https://github.com/openwrt/luci.git^79cf66900e038f0d03376edc7033c385030a5222
+            src-git routing https://github.com/openwrt-routing/packages.git^bb289e1f913f4509cb1a61d06f6eeb4c560adcec
+            EOF
+            
+            # 更新 feeds
+            retry ./scripts/feeds update -a
+            ./scripts/feeds install luci luci-app-qos luci-app-ddns ddns-scripts
+            
+            # 写入 .config
+            cat > .config << "EOF"
+            CONFIG_TARGET_ramips=y
+            CONFIG_TARGET_ramips_mt76x8=y
+            CONFIG_TARGET_ramips_mt76x8_DEVICE_mt7688=y
+            CONFIG_TARGET_OPTIONS=y
+            CONFIG_TARGET_OPTIONS_BAUDRATE_115200=y
+            CONFIG_KERNEL_BRIDGE=y
+            CONFIG_KERNEL_VLAN_8021Q=y
+            CONFIG_PACKAGE_dnsmasq=y
+            CONFIG_PACKAGE_iptables=y
+            CONFIG_PACKAGE_iptables-mod-nat=y
+            CONFIG_PACKAGE_kmod-rt2800-soc=y
+            CONFIG_PACKAGE_wpad-mini=y
+            CONFIG_PACKAGE_hostapd-mini=y
+            CONFIG_PACKAGE_kmod-usb-core=y
+            CONFIG_PACKAGE_kmod-usb-ohci=y
+            CONFIG_PACKAGE_kmod-usb-storage=y
+            CONFIG_PACKAGE_kmod-usb2=y
+            CONFIG_PACKAGE_kmod-sdio=y
+            CONFIG_PACKAGE_kmod-mmc=y
+            CONFIG_PACKAGE_kmod-tun=y
+            CONFIG_PACKAGE_kmod-sched=y
+            CONFIG_PACKAGE_luci-app-qos=y
+            CONFIG_PACKAGE_ddns-scripts=y
+            CONFIG_PACKAGE_luci-app-ddns=y
+            CONFIG_PACKAGE_luci=y
+            CONFIG_PACKAGE_luci-mod-admin-full=y
+            CONFIG_TARGET_ROOTFS_SQUASHFS=y
+            CONFIG_PACKAGE_ipv6=n
+            CONFIG_PACKAGE_kmod-ipv6=n
+            CONFIG_PACKAGE_samba36=n
+            CONFIG_PACKAGE_miniupnpd=n
+            EOF
+            
+            echo "========== .config =========="
+            cat .config
+            echo "=============================="
+            
+            # 生成配置并编译
+            make defconfig
+            
+            # 下载源码（带重试）
+            retry make download V=s
+            
+            echo "开始编译，首次编译约 1.5-2 小时..."
+            make -j4 V=s 2>&1 | tee build.log
+            
+            echo "========== Firmware files =========="
+            find bin/ -name '\''*.bin'\'' -o -name '\''*.trx'\'' | xargs ls -lh
+            echo "====================================="
+          '
           EOF_SCRIPT
           
           # 重试机制运行容器
