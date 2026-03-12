@@ -88,13 +88,31 @@ jobs:
               make -j1 V=s FORCE=1
             '
 
-            mkdir -p /openwrt/bin
-            cp -r /openwrt/bin /openwrt/ || true
+            # 修复：创建目标目录并正确复制文件
+            mkdir -p /openwrt/artifacts
+            cp -rf /openwrt/bin/* /openwrt/artifacts/ 2>/dev/null || true
+            # 也复制固件输出目录
+            cp -rf /openwrt/bin/ramips /openwrt/artifacts/ 2>/dev/null || true
           "
+
+      - name: Copy artifacts from Docker container
+        run: |
+          # 从 Docker 容器中复制文件
+          mkdir -p ${{ github.workspace }}/bin
+          docker cp openwrt-build:/openwrt/artifacts/. ${{ github.workspace }}/bin/ || true
+          docker cp openwrt-build:/openwrt/bin/ramips ${{ github.workspace }}/bin/ 2>/dev/null || true
+          
+          # 列出找到的文件以便调试
+          echo "Files in bin directory:"
+          ls -la ${{ github.workspace }}/bin/ || echo "bin directory is empty"
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: openwrt-bin
-          path: bin/
+          name: openwrt-firmware
+          path: |
+            bin/
+            !bin/**/*.o
+            !bin/**/*.d
           retention-days: 30
+          if-no-files-found: warn
