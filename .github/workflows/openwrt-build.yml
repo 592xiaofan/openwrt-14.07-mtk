@@ -48,12 +48,67 @@ jobs:
             # ========== 4. 切换普通用户执行编译（关键！） ==========
             su - openwrt -c '
               cd /openwrt
-              # 更新feeds（修复SSL后可正常拉取）
-              ./scripts/feeds update -a || ./scripts/feeds update -a  # 失败重试
+
+              # ========== 在这里自动写入 .config（你要的全部功能） ==========
+              cat > .config << EOF
+              CONFIG_TARGET_ramips=y
+              CONFIG_TARGET_ramips_rt305x=y
+              CONFIG_CPU_MIPSR2_IRQ_VI=y
+              CONFIG_KERNEL_BRIDGE=y
+              CONFIG_KERNEL_VLAN_8021Q=y
+
+              # 基础网络
+              CONFIG_PACKAGE_dnsmasq=y
+              CONFIG_PACKAGE_iptables=y
+              CONFIG_PACKAGE_iptables-mod-nat=y
+
+              # WiFi
+              CONFIG_PACKAGE_kmod-rt2800-soc=y
+              CONFIG_PACKAGE_wpad-mini=y
+              CONFIG_PACKAGE_hostapd-mini=y
+
+              # USB
+              CONFIG_PACKAGE_kmod-usb-core=y
+              CONFIG_PACKAGE_kmod-usb-ohci=y
+              CONFIG_PACKAGE_kmod-usb-storage=y
+
+              # SDIO for txw8301
+              CONFIG_PACKAGE_kmod-sdio=y
+              CONFIG_PACKAGE_kmod-mmc=y
+
+              # VPN 内核支持
+              CONFIG_PACKAGE_kmod-tun=y
+
+              # QoS
+              CONFIG_PACKAGE_kmod-sched=y
+              CONFIG_PACKAGE_luci-app-qos=y
+
+              # DDNS
+              CONFIG_PACKAGE_ddns-scripts=y
+              CONFIG_PACKAGE_luci-app-ddns=y
+
+              # LuCI 管理页面
+              CONFIG_PACKAGE_luci=y
+              CONFIG_PACKAGE_luci-mod-admin-full=y
+              CONFIG_PACKAGE_luci-mod-network=y
+              CONFIG_PACKAGE_luci-mod-wireless=y
+
+              # 关闭无用功能（提速、缩体积）
+              CONFIG_PACKAGE_ipv6=n
+              CONFIG_PACKAGE_kmod-ipv6=n
+              CONFIG_PACKAGE_samba36=n
+              CONFIG_PACKAGE_miniupnpd=n
+              CONFIG_DEVEL=n
+              EOF
+
+              # 更新feeds
+              ./scripts/feeds update -a || ./scripts/feeds update -a
               ./scripts/feeds install -a
-              # 生成配置+强制跳过部分严格检查（兼容旧版）
+
+              # 生成配置
               make defconfig FORCE=1
-              # 编译（单核心更稳定，避免资源不足）
+
+              # 编译（单核心稳定）
               make -j1 V=s FORCE=1
             '
 
@@ -77,7 +132,7 @@ jobs:
       # 创建Release（仅编译成功时）
       - name: Create Release
         if: success()
-        uses: softprops/action-gh-release@v2
+        uses: softprops/gh-release@v2
         with:
           tag_name: openwrt-14.07-mtk-${{ github.run_id }}
           name: OpenWrt 14.07-mtk 编译产物-${{ steps.date.outputs.now }}
