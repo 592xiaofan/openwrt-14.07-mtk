@@ -11,13 +11,18 @@ jobs:
 
     steps:
       - name: Checkout source
-        uses: actions/checkout@v4
+        uses: actions/checkout@v4.1.7
         with:
           path: openwrt
           fetch-depth: 1
 
       - name: Create ccache directory
         run: mkdir -p ${{ github.workspace }}/ccache
+
+      - name: Set build environment
+        run: |
+          echo "BUILD_START_TIME=$(date '+%Y-%m-%d %H:%M:%S')" >> $GITHUB_ENV
+          echo "BUILD_TIMESTAMP=$(date '+%s')" >> $GITHUB_ENV
 
       - name: Build in Ubuntu 12.04 container
         id: build
@@ -29,9 +34,12 @@ jobs:
             ubuntu:12.04 /bin/bash -c "
             set -exo pipefail
 
+            # 错误处理
+            trap 'echo "Build failed at line $\$LINENO"' ERR
+
             # 更换为旧版本软件源
             sed -i 's/archive.ubuntu.com/old-releases.ubuntu.com/g' /etc/apt/sources.list
-            apt-get update
+            apt-get update || apt-get update
             apt-get install -y build-essential subversion libncurses5-dev zlib1g-dev gawk gcc-multilib flex git-core gettext libssl-dev unzip python2.7 file wget curl ccache
 
             # 验证 GCC 版本 (应为 4.6.3)
@@ -101,12 +109,26 @@ jobs:
 
             make defconfig
 
-            # 下载源码包
-            make download V=s
+            # 下载源码包（带重试机制）
+            echo '========== Downloading packages =========='
+            for i in {1..3}; do
+              make download V=s && break || {
+                if [ \$i -lt 3 ]; then
+                  echo "Download attempt \$i failed, retrying..."
+                  sleep 10
+                else
+                  echo "Download failed after 3 attempts"
+                  exit 1
+                fi
+              }
+            done
+            echo '========== Download complete =========='
 
             # 编译
+            echo '========== Starting build =========='
             CPUS=\$(nproc)
             [ \$CPUS -gt 4 ] && CPUS=4
+            echo "Using \$CPUS CPU cores"
             make -j\$CPUS V=s 2>&1 | tee build.log
 
             # 检查固件是否生成
@@ -124,14 +146,52 @@ jobs:
         if: always()
         run: |
           mkdir -p ${{ github.workspace }}/firmware ${{ github.workspace }}/logs
-          docker cp openwrt-build:/openwrt/bin/. ${{ github.workspace }}/firmware/ || echo "Failed to copy firmware"
-          docker cp openwrt-build:/openwrt/build.log ${{ github.workspace }}/logs/ || echo "Failed to copy build.log"
-          docker cp openwrt-build:/openwrt/.config ${{ github.workspace }}/logs/config.txt || echo "Failed to copy .config"
-          docker cp openwrt-build:/openwrt/feeds.conf ${{ github.workspace }}/logs/feeds.conf 2>/dev/null || true
-          sudo chown -R $USER:$USER ${{ github.workspace }}/firmware ${{ github.workspace }}/logs
+          
+          # 复制固件
+          docker cp openwrt-build:/openwrt/bin/. ${{ github.workspace }}/firmware/ 2>/dev/null || {
+            echo "Warning: Failed to copy firmware"
+            mkdir -p ${{ github.workspace }}/firmware
+          }
+          
+          # 复制日志文件
+          docker cp openwrt-build:/openwrt/build.log ${{ github.workspace }}/logs/ 2>/dev/null || echo "Warning: Failed to copy build.log"
+          docker cp openwrt-build:/openwrt/.config ${{ github.workspace }}/logs/config.txt 2>/dev/null || echo "Warning: Failed to copy .config"
+          docker cp openwrt-build:/openwrt/feeds.conf ${{ github.workspace }}/logs/feeds.conf 2>/dev/null || echo "Warning: Failed to copy feeds.conf"
+          
+          # 修复权限
+          sudo chown -R $USER:$USER ${{ github.workspace }}/firmware ${{ github.workspace }}/logs 2>/dev/null || true
+
+      - name: Clean up Docker container
+        if: always()
+        run: |
+          docker stop openwrt-build 2>/dev/null || true
+          docker rm openwrt-build 2>/dev/null || true
+
+      - name: Generate build summary
+        if: always()
+        run: |
+          BUILD_END_TIME=$(date '+%Y-%m-%d %H:%M:%S')
+          BUILD_DURATION=$(($(date '+%s') - ${{ env.BUILD_TIMESTAMP }}))
+          
+          echo "## 🔨 OpenWrt Build Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| 项目 | 值 |" >> $GITHUB_STEP_SUMMARY
+          echo "|------|-----|" >> $GITHUB_STEP_SUMMARY
+          echo "| 开始时间 | ${{ env.BUILD_START_TIME }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| 结束时间 | $BUILD_END_TIME |" >> $GITHUB_STEP_SUMMARY
+          echo "| 耗时 | $((BUILD_DURATION / 60)) 分 $((BUILD_DURATION % 60)) 秒 |" >> $GITHUB_STEP_SUMMARY
+          echo "| 状态 | ${{ job.status }} |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          # 列出生成的固件
+          if [ -d "${{ github.workspace }}/firmware" ] && [ -n "$(find ${{ github.workspace }}/firmware -type f 2>/dev/null)" ]; then
+            echo "### 📦 固件文件" >> $GITHUB_STEP_SUMMARY
+            find ${{ github.workspace }}/firmware -type f -exec ls -lh {} \; | awk '{print "- `" $9 "` (" $5 ")"}' >> $GITHUB_STEP_SUMMARY || echo "- 未找到固件文件" >> $GITHUB_STEP_SUMMARY
+          fi
 
       - name: Upload firmware artifacts
-        uses: actions/upload-artifact@v4
+        if: success()
+        uses: actions/upload-artifact@v4.3.1
         with:
           name: openwrt-14.07-mt7688-basic
           path: firmware/
@@ -140,16 +200,28 @@ jobs:
 
       - name: Upload build logs (always)
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v4.3.1
         with:
           name: build-logs
           path: logs/
           retention-days: 30
+          if-no-files-found: ignore
 
-      - name: Cache ccache
-        uses: actions/cache@v3
+      - name: Cache ccache (save)
+        if: always()
+        uses: actions/cache@v3.3.3
         with:
           path: ccache
-          key: ccache-${{ runner.os }}-${{ github.sha }}
+          key: ccache-${{ runner.os }}-${{ github.ref_name }}-${{ github.run_id }}
           restore-keys: |
+            ccache-${{ runner.os }}-${{ github.ref_name }}-
             ccache-${{ runner.os }}-
+
+      - name: Cleanup workspace
+        if: always()
+        run: |
+          echo "Workspace size before cleanup:"
+          du -sh ${{ github.workspace }}/*
+          
+          # 清理大型临时文件（可选）
+          rm -rf ${{ github.workspace }}/openwrt/.git ${{ github.workspace }}/openwrt/build_dir 2>/dev/null || true
