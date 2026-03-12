@@ -1,7 +1,7 @@
 name: Build OpenWrt 14.07-mtk
 
 on:
-  workflow_dispatch:  # 仅手动触发
+  workflow_dispatch:
 
 jobs:
   build:
@@ -10,90 +10,70 @@ jobs:
       contents: write
 
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Get current time
+      - name: Get time
         id: date
         run: |
           echo "now=$(date +'%Y-%m-%d %H:%M:%S' --utc '+8 hours')" >> $GITHUB_OUTPUT
 
-      # 核心编译步骤：解决SSL+依赖+root编译所有问题
-      - name: Build in Ubuntu 16.04 container (fix all issues)
+      - name: Build
         run: |
           docker run -e TZ=Asia/Shanghai -v ${{ github.workspace }}:/openwrt --name openwrt-build ubuntu:16.04 /bin/bash -c "
-            # ========== 1. 修复源+安装基础依赖 ==========
-            echo 'deb http://archive.ubuntu.com/ubuntu/ xenial main restricted universe multiverse' > /etc/apt/sources.list
-            echo 'deb http://archive.ubuntu.com/ubuntu/ xenial-updates main restricted universe multiverse' >> /etc/apt/sources.list
-            echo 'deb http://archive.ubuntu.com/ubuntu/ xenial-security main restricted universe multiverse' >> /etc/apt/sources.list
-            apt-get update -y
-            # 安装所有依赖（含SSL证书、file、openssl）
+            apt-get update > /dev/null
             apt-get install -y --no-install-recommends \
               build-essential subversion libncurses5-dev zlib1g-dev \
               gawk gcc-multilib flex git-core gettext libssl-dev unzip \
               make gcc g++ wget curl python2.7 openssl file ca-certificates \
-              bzip2 perl tar findutils libssl1.0.0
+              bzip2 perl tar findutils libssl1.0.0 sudo > /dev/null
 
-            # ========== 2. 修复SSL证书（核心解决feeds拉取失败） ==========
-            update-ca-certificates -f  # 更新CA证书，解决git SSL验证问题
-            # 强制git使用https时忽略证书（兜底方案）
+            update-ca-certificates -f
             git config --global http.sslVerify false
 
-            # ========== 3. 创建普通用户（解决root编译限制） ==========
-            useradd -m openwrt && chown -R openwrt:openwrt /openwrt
+            useradd -m openwrt
+            chown -R openwrt:openwrt /openwrt
             echo 'openwrt ALL=(ALL) NOPASSWD: ALL' >> /etc/sudoers
 
-            # ========== 4. 切换普通用户执行编译（关键！） ==========
             su - openwrt -c '
               cd /openwrt
 
-              # ========== 自动写入精简.config ==========
-              cat > .config << EOF
+              cat > .config <<- "EOF"
               CONFIG_TARGET_ramips=y
               CONFIG_TARGET_ramips_rt305x=y
               CONFIG_CPU_MIPSR2_IRQ_VI=y
               CONFIG_KERNEL_BRIDGE=y
               CONFIG_KERNEL_VLAN_8021Q=y
 
-              # 基础网络
               CONFIG_PACKAGE_dnsmasq=y
               CONFIG_PACKAGE_iptables=y
               CONFIG_PACKAGE_iptables-mod-nat=y
 
-              # WiFi
               CONFIG_PACKAGE_kmod-rt2800-soc=y
               CONFIG_PACKAGE_wpad-mini=y
               CONFIG_PACKAGE_hostapd-mini=y
 
-              # USB
               CONFIG_PACKAGE_kmod-usb-core=y
               CONFIG_PACKAGE_kmod-usb-ohci=y
               CONFIG_PACKAGE_kmod-usb-storage=y
 
-              # SDIO for txw8301
               CONFIG_PACKAGE_kmod-sdio=y
               CONFIG_PACKAGE_kmod-mmc=y
 
-              # VPN 内核支持
               CONFIG_PACKAGE_kmod-tun=y
 
-              # QoS
               CONFIG_PACKAGE_kmod-sched=y
               CONFIG_PACKAGE_luci-app-qos=y
 
-              # DDNS
               CONFIG_PACKAGE_ddns-scripts=y
               CONFIG_PACKAGE_luci-app-ddns=y
 
-              # LuCI 管理页面
               CONFIG_PACKAGE_luci=y
               CONFIG_PACKAGE_luci-mod-admin-full=y
               CONFIG_PACKAGE_luci-mod-network=y
               CONFIG_PACKAGE_luci-mod-wireless=y
 
-              # 关闭无用功能
               CONFIG_PACKAGE_ipv6=n
               CONFIG_PACKAGE_kmod-ipv6=n
               CONFIG_PACKAGE_samba36=n
@@ -101,51 +81,20 @@ jobs:
               CONFIG_DEVEL=n
               EOF
 
-              # 更新feeds
               ./scripts/feeds update -a || ./scripts/feeds update -a
               ./scripts/feeds install -a
 
-              # 生成配置
               make defconfig FORCE=1
-
-              # 编译（单核心稳定）
               make -j1 V=s FORCE=1
             '
 
-            # ========== 5. 复制产物到挂载目录 ==========
-            if [ -d "/openwrt/bin" ]; then
-              cp -r /openwrt/bin /openwrt/
-            else
-              echo "编译产物目录不存在，创建空目录避免cp报错"
-              mkdir -p /openwrt/bin
-            fi
+            mkdir -p /openwrt/bin
+            cp -r /openwrt/bin /openwrt/ || true
           "
 
-      # 上传产物
-      - name: Upload build artifacts
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: openwrt-14.07-mtk-bin-${{ github.run_id }}
-          path: ${{ github.workspace }}/bin/
+          name: openwrt-bin
+          path: bin/
           retention-days: 30
-
-      # 创建Release（修复action名称）
-      - name: Create Release
-        if: success()
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: openwrt-14.07-mtk-${{ github.run_id }}
-          name: OpenWrt 14.07-mtk 编译产物-${{ steps.date.outputs.now }}
-          files: ${{ github.workspace }}/bin/**/*
-          body: |
-            📌 编译环境：Ubuntu 16.04（修复SSL+root+依赖）
-            🕒 编译时间（UTC+8）：${{ steps.date.outputs.now }}
-            🆔 运行ID：${{ github.run_id }}
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      # 清理容器
-      - name: Clean up container
-        if: always()
-        run: |
-          docker rm -f openwrt-build || true
