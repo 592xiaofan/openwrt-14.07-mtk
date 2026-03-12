@@ -19,130 +19,200 @@ jobs:
         run: |
           echo "now=$(date +'%Y-%m-%d %H:%M:%S' --utc '+8 hours')" >> $GITHUB_OUTPUT
 
-      - name: Build
+      - name: Build OpenWrt
         run: |
           docker run -e TZ=Asia/Shanghai -v ${{ github.workspace }}:/openwrt --name openwrt-build ubuntu:16.04 /bin/bash -c "
-            apt-get update > /dev/null
+            set -x  # 开启调试模式
+            
+            apt-get update
             apt-get install -y --no-install-recommends \
               build-essential subversion libncurses5-dev zlib1g-dev \
               gawk gcc-multilib flex git-core gettext libssl-dev unzip \
               make gcc g++ wget curl python2.7 openssl file ca-certificates \
-              bzip2 perl tar findutils libssl1.0.0 sudo > /dev/null
+              bzip2 perl tar findutils libssl1.0.0 sudo rsync
 
             update-ca-certificates -f
             git config --global http.sslVerify false
 
+            # 下载 OpenWrt 14.07 源码
+            cd /openwrt
+            if [ ! -d \"openwrt\" ]; then
+              git clone https://github.com/openwrt/archive.git openwrt-14.07
+              cd openwrt-14.07
+              git checkout openwrt-14.07
+            else
+              cd openwrt-14.07
+            fi
+
+            # 创建用户并设置权限
             useradd -m openwrt
             chown -R openwrt:openwrt /openwrt
             echo 'openwrt ALL=(ALL) NOPASSWD: ALL' >> /etc/sudoers
 
+            # 切换到 openwrt 用户执行构建
             su - openwrt -c '
-              cd /openwrt
+              cd /openwrt/openwrt-14.07
               
-              # 创建配置文件
+              # 创建 feeds 配置文件
+              mkdir -p files
+              
+              # 创建完整的配置文件
               cat > .config << \"EOF\"
+              # Target
               CONFIG_TARGET_ramips=y
               CONFIG_TARGET_ramips_rt305x=y
+              CONFIG_TARGET_ramips_rt305x_DEVICE_rt305x=y
+              
+              # CPU
               CONFIG_CPU_MIPSR2_IRQ_VI=y
+              
+              # Kernel
               CONFIG_KERNEL_BRIDGE=y
               CONFIG_KERNEL_VLAN_8021Q=y
-              
-              # 设置串口波特率为115200
-              CONFIG_TARGET_ramips_rt305x_DEVICE_BAUDRATE=115200
-              CONFIG_KERNEL_EARLY_PRINTK=y
               CONFIG_KERNEL_CMDLINE_OVERRIDE=y
               
+              # 串口设置 (115200)
+              CONFIG_TARGET_OPTIONS=y
+              CONFIG_TARGET_OPTIONS_BAUDRATE_115200=y
+              
+              # 基础包
               CONFIG_PACKAGE_dnsmasq=y
               CONFIG_PACKAGE_iptables=y
               CONFIG_PACKAGE_iptables-mod-nat=y
               
+              # 无线驱动
               CONFIG_PACKAGE_kmod-rt2800-soc=y
+              CONFIG_PACKAGE_kmod-rt2x00-lib=y
+              CONFIG_PACKAGE_kmod-rt2800-lib=y
               CONFIG_PACKAGE_wpad-mini=y
               CONFIG_PACKAGE_hostapd-mini=y
               
+              # USB 支持
               CONFIG_PACKAGE_kmod-usb-core=y
               CONFIG_PACKAGE_kmod-usb-ohci=y
               CONFIG_PACKAGE_kmod-usb-storage=y
               
+              # SD/MMC 支持
               CONFIG_PACKAGE_kmod-sdio=y
               CONFIG_PACKAGE_kmod-mmc=y
               
+              # VPN
               CONFIG_PACKAGE_kmod-tun=y
               
+              # QoS
               CONFIG_PACKAGE_kmod-sched=y
               CONFIG_PACKAGE_luci-app-qos=y
               
+              # DDNS
               CONFIG_PACKAGE_ddns-scripts=y
               CONFIG_PACKAGE_luci-app-ddns=y
               
+              # Luci
               CONFIG_PACKAGE_luci=y
               CONFIG_PACKAGE_luci-mod-admin-full=y
               CONFIG_PACKAGE_luci-mod-network=y
               CONFIG_PACKAGE_luci-mod-wireless=y
+              CONFIG_PACKAGE_luci-theme-bootstrap=y
               
               # 禁用不需要的功能
               CONFIG_PACKAGE_ipv6=n
               CONFIG_PACKAGE_kmod-ipv6=n
               CONFIG_PACKAGE_samba36=n
               CONFIG_PACKAGE_miniupnpd=n
+              
+              # 开发选项
               CONFIG_DEVEL=n
+              CONFIG_CCACHE=n
+              
+              # 固件大小
+              CONFIG_TARGET_ROOTFS_INITRAMFS=y
+              CONFIG_TARGET_ROOTFS_SQUASHFS=y
               EOF
 
-              # 显示配置以便调试
-              echo \"========== .config content ==========\"
+              echo \"=== Generated .config ===\"
               cat .config
-              echo \"=====================================\"
+              echo \"==========================\"
 
+              # 更新 feeds
               ./scripts/feeds update -a
               ./scripts/feeds install -a
 
-              make defconfig FORCE=1
-              make -j\$(nproc) V=s FORCE=1
+              # 生成默认配置并合并
+              make defconfig
+              
+              # 下载源码包
+              make download V=s
+              
+              # 开始编译
+              echo \"Starting compilation...\"
+              make -j1 V=s FORCE=1 2>&1 | tee build.log
             '
 
-            # 在容器内创建输出目录并复制文件
-            mkdir -p /openwrt/output
-            cp -rf /openwrt/bin/* /openwrt/output/ 2>/dev/null || true
-            echo \"Files in output directory:\"
-            ls -la /openwrt/output/ || echo \"No files found\"
+            # 收集编译产物
+            echo \"=== Searching for firmware files ===\"
+            mkdir -p /openwrt/firmware
+            
+            # 查找所有可能的固件文件
+            find /openwrt/openwrt-14.07/bin -type f \( -name \"*.bin\" -o -name \"*.trx\" -o -name \"*.img\" -o -name \"*-squashfs*\" \) -exec cp {} /openwrt/firmware/ \;
+            
+            # 也复制整个 bin 目录结构
+            cp -rf /openwrt/openwrt-14.07/bin /openwrt/firmware-bin/
+            
+            echo \"=== Collected firmware files ===\"
+            ls -la /openwrt/firmware/ || echo \"No firmware files found\"
+            
+            # 复制构建日志
+            cp /openwrt/openwrt-14.07/build.log /openwrt/ 2>/dev/null || true
           "
 
-      - name: Copy artifacts from container
+      - name: Copy firmware from container
         run: |
-          # 创建工作目录（使用 sudo 解决权限问题）
-          sudo mkdir -p ${{ github.workspace }}/bin
-          sudo chown -R $USER:$USER ${{ github.workspace }}/bin
+          # 创建工作目录
+          sudo mkdir -p ${{ github.workspace }}/firmware
+          sudo chown -R $USER:$USER ${{ github.workspace }}/firmware
           
-          # 从容器复制文件
-          docker cp openwrt-build:/openwrt/output/. ${{ github.workspace }}/bin/ || echo "No files copied from output"
-          docker cp openwrt-build:/openwrt/bin/ramips ${{ github.workspace }}/bin/ 2>/dev/null || echo "No ramips files found"
+          # 从容器复制固件文件
+          docker cp openwrt-build:/openwrt/firmware/. ${{ github.workspace }}/firmware/ 2>/dev/null || echo "No firmware files in /openwrt/firmware"
+          docker cp openwrt-build:/openwrt/firmware-bin/. ${{ github.workspace }}/firmware-bin/ 2>/dev/null || echo "No firmware-bin files"
+          docker cp openwrt-build:/openwrt/build.log ${{ github.workspace }}/ 2>/dev/null || echo "No build.log"
           
           # 设置正确的权限
-          sudo chown -R $USER:$USER ${{ github.workspace }}/bin
+          sudo chown -R $USER:$USER ${{ github.workspace }}/firmware ${{ github.workspace }}/firmware-bin 2>/dev/null || true
           
           # 显示找到的文件
-          echo "=== Files in bin directory ==="
-          find ${{ github.workspace }}/bin -type f -name "*.bin" -o -name "*.trx" -o -name "*.img" | head -20
-          echo "================================"
+          echo "=== Firmware files found ==="
+          find ${{ github.workspace }}/firmware -type f -name "*.bin" -o -name "*.trx" -o -name "*.img" 2>/dev/null | head -20 || echo "No firmware files"
+          
+          echo "=== All files in firmware directory ==="
+          ls -la ${{ github.workspace }}/firmware/ || echo "firmware directory empty"
+          
+          echo "=== Build log (first 50 lines) ==="
+          head -50 ${{ github.workspace }}/build.log 2>/dev/null || echo "No build.log"
 
-      - name: Upload firmware artifacts
+      - name: Upload firmware
+        if: success() || failure()
         uses: actions/upload-artifact@v4
         with:
           name: openwrt-14.07-firmware
           path: |
-            bin/**/*.bin
-            bin/**/*.trx
-            bin/**/*.img
-            bin/**/openwrt-ramips-*
+            firmware/**/*.bin
+            firmware/**/*.trx
+            firmware/**/*.img
+            firmware/**/*.squashfs*
+            firmware-bin/**/*.bin
+            firmware-bin/**/*.trx
+            firmware-bin/**/*.img
+            firmware-bin/**/*.squashfs*
           retention-days: 30
           if-no-files-found: warn
 
-      - name: Upload full build output (for debugging)
-        if: failure()
+      - name: Upload build log
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: build-logs
+          name: build-log
           path: |
-            bin/**/*
-            logs/
-          retention-days: 7
+            build.log
+            firmware-bin/**/*.log
+          retention-days: 30
+          if-no-files-found: warn
