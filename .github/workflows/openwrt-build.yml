@@ -92,7 +92,7 @@ jobs:
           echo "=== GCC Version ==="
           gcc --version | head -1
           
-          # 创建普通用户（关键修复！）
+          # 创建普通用户
           useradd -m openwrt
           
           # 设置源码目录权限
@@ -161,9 +161,32 @@ jobs:
             echo "开始编译，首次编译约 1.5-2 小时..."
             make -j4 V=s 2>&1 | tee build.log
             
-            echo "========== Firmware files =========="
-            find bin/ -name '\''*.bin'\'' -o -name '\''*.trx'\'' | xargs ls -lh
-            echo "====================================="
+            # ========== 修复：更精确地查找固件文件 ==========
+            echo "========== 查找固件文件 =========="
+            
+            # 创建输出目录
+            mkdir -p /openwrt/output
+            
+            # 查找所有可能的固件文件并复制到统一目录
+            find /openwrt/bin -type f \( \
+              -name "*.bin" -o \
+              -name "*.trx" -o \
+              -name "*.img" -o \
+              -name "*squashfs*" -o \
+              -name "*sysupgrade*" -o \
+              -name "*factory*" \) \
+              -exec cp -v {} /openwrt/output/ \;
+            
+            # 如果 output 目录为空，则复制整个 bin 目录
+            if [ -z "$(ls -A /openwrt/output)" ]; then
+              echo "未找到固件文件，复制整个 bin 目录"
+              cp -rf /openwrt/bin /openwrt/output/
+            fi
+            
+            # 列出找到的文件
+            echo "找到的固件文件："
+            ls -la /openwrt/output/
+            echo "======================================"
           '
           EOF_SCRIPT
           
@@ -197,22 +220,53 @@ jobs:
           echo "所有重试都失败了"
           exit 1
 
-      - name: 从容器复制固件
+      - name: 从容器复制固件（修复版）
         if: always()
         run: |
+          # 创建输出目录
           mkdir -p ${{ github.workspace }}/firmware ${{ github.workspace }}/logs
-          docker cp openwrt-build:/openwrt/bin/. ${{ github.workspace }}/firmware/ 2>/dev/null || echo "No firmware found"
+          
+          # 尝试从 output 目录复制
+          echo "尝试从 /openwrt/output 复制..."
+          docker cp openwrt-build:/openwrt/output/. ${{ github.workspace }}/firmware/ 2>/dev/null || echo "No files in /openwrt/output"
+          
+          # 如果 output 为空，尝试直接从 bin 复制
+          if [ -z "$(ls -A ${{ github.workspace }}/firmware 2>/dev/null)" ]; then
+            echo "尝试从 /openwrt/bin 复制..."
+            docker cp openwrt-build:/openwrt/bin/. ${{ github.workspace }}/firmware/ 2>/dev/null || echo "No files in /openwrt/bin"
+          fi
+          
+          # 复制构建日志
           docker cp openwrt-build:/openwrt/build.log ${{ github.workspace }}/logs/ 2>/dev/null || echo "No build.log"
           docker cp openwrt-build:/openwrt/.config ${{ github.workspace }}/logs/config.txt 2>/dev/null || true
+          
           # 修复权限
           sudo chown -R $USER:$USER ${{ github.workspace }}/firmware ${{ github.workspace }}/logs 2>/dev/null || true
+          
+          # 显示找到的文件
+          echo "========== 最终找到的固件文件 =========="
+          find ${{ github.workspace }}/firmware -type f -name "*.bin" -o -name "*.trx" -o -name "*.img" 2>/dev/null | head -20 || echo "未找到固件文件"
+          echo "========================================"
 
       - name: 上传固件
         uses: actions/upload-artifact@v4
         with:
           name: openwrt-14.07-mt7688-firmware-${{ github.run_id }}
-          path: firmware/
+          path: |
+            firmware/**/*.bin
+            firmware/**/*.trx
+            firmware/**/*.img
+            firmware/**/*.squashfs*
           retention-days: 30
+          if-no-files-found: warn
+
+      - name: 上传完整构建输出（调试用）
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: full-build-output-${{ github.run_id }}
+          path: firmware/
+          retention-days: 7
           if-no-files-found: warn
 
       - name: 上传构建日志
