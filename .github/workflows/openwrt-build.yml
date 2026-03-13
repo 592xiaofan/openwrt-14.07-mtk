@@ -37,7 +37,7 @@ jobs:
         run: |
           cat > build_script.sh << 'EOF_SCRIPT'
           #!/bin/bash
-          set -ex
+          set -exuo pipefail  # 添加 pipefail，确保管道命令中的错误会被捕获
           
           retry() {
             local n=1
@@ -77,7 +77,7 @@ jobs:
           install_deps() {
             retry apt-get install -y build-essential subversion libncurses5-dev zlib1g-dev gawk \
               gcc-multilib flex git-core gettext libssl-dev unzip python2.7 file wget curl \
-              tree  # 添加 tree 命令方便查看目录结构
+              tree time
           }
           
           update_source
@@ -89,125 +89,134 @@ jobs:
           useradd -m openwrt
           chown -R openwrt:openwrt /openwrt
           
-          su - openwrt -c '
-            cd /openwrt
-            
-            # 重写 feeds.conf
-            cat > feeds.conf << "EOF"
-            src-git packages https://github.com/openwrt/packages.git^0b0ec2fce2974e6f74a8de342957cba6e186d924
-            src-git luci https://github.com/openwrt/luci.git^79cf66900e038f0d03376edc7033c385030a5222
-            src-git routing https://github.com/openwrt-routing/packages.git^bb289e1f913f4509cb1a61d06f6eeb4c560adcec
-            EOF
-            
-            retry ./scripts/feeds update -a
-            ./scripts/feeds install luci luci-app-qos luci-app-ddns ddns-scripts
-            
-            cat > .config << "EOF"
-            CONFIG_TARGET_ramips=y
-            CONFIG_TARGET_ramips_mt76x8=y
-            CONFIG_TARGET_ramips_mt76x8_DEVICE_mt7688=y
-            CONFIG_TARGET_OPTIONS=y
-            CONFIG_TARGET_OPTIONS_BAUDRATE_115200=y
-            CONFIG_KERNEL_BRIDGE=y
-            CONFIG_KERNEL_VLAN_8021Q=y
-            CONFIG_PACKAGE_dnsmasq=y
-            CONFIG_PACKAGE_iptables=y
-            CONFIG_PACKAGE_iptables-mod-nat=y
-            CONFIG_PACKAGE_kmod-rt2800-soc=y
-            CONFIG_PACKAGE_wpad-mini=y
-            CONFIG_PACKAGE_hostapd-mini=y
-            CONFIG_PACKAGE_kmod-usb-core=y
-            CONFIG_PACKAGE_kmod-usb-ohci=y
-            CONFIG_PACKAGE_kmod-usb-storage=y
-            CONFIG_PACKAGE_kmod-usb2=y
-            CONFIG_PACKAGE_kmod-sdio=y
-            CONFIG_PACKAGE_kmod-mmc=y
-            CONFIG_PACKAGE_kmod-tun=y
-            CONFIG_PACKAGE_kmod-sched=y
-            CONFIG_PACKAGE_luci-app-qos=y
-            CONFIG_PACKAGE_ddns-scripts=y
-            CONFIG_PACKAGE_luci-app-ddns=y
-            CONFIG_PACKAGE_luci=y
-            CONFIG_PACKAGE_luci-mod-admin-full=y
-            CONFIG_TARGET_ROOTFS_SQUASHFS=y
-            CONFIG_PACKAGE_ipv6=n
-            CONFIG_PACKAGE_kmod-ipv6=n
-            CONFIG_PACKAGE_samba36=n
-            CONFIG_PACKAGE_miniupnpd=n
-            EOF
-            
-            echo "========== .config =========="
-            cat .config
-            echo "=============================="
-            
-            make defconfig
-            retry make download V=s
-            
-            echo "开始编译，首次编译约 1.5-2 小时..."
-            make -j4 V=s 2>&1 | tee build.log
-            
-            # ========== 全面的固件查找 ==========
-            echo "========== 开始全面查找固件文件 =========="
-            
-            # 创建输出目录
-            mkdir -p /openwrt/output
-            
-            # 1. 显示完整的目录结构
-            echo "=== 查看 /openwrt 目录结构 ==="
-            ls -la /openwrt/
-            
-            echo "=== 查看 /openwrt/bin 目录（如果存在）==="
-            if [ -d "/openwrt/bin" ]; then
-              ls -la /openwrt/bin/
-              tree /openwrt/bin/ -L 3 || true
-            else
-              echo "/openwrt/bin 目录不存在"
-            fi
-            
-            # 2. 在整个文件系统中搜索固件文件
-            echo "=== 在整个 /openwrt 中搜索固件文件 ==="
-            find /openwrt -type f \( \
-              -name "*.bin" -o \
-              -name "*.trx" -o \
-              -name "*.img" -o \
-              -name "*squashfs*" -o \
-              -name "*sysupgrade*" -o \
-              -name "*factory*" \) \
-              -exec ls -lh {} \; \
-              -exec cp {} /openwrt/output/ \;
-            
-            # 3. 搜索所有可能的编译输出目录
-            echo "=== 搜索常见的编译输出目录 ==="
-            find /openwrt -type d \( \
-              -name "bin" -o \
-              -name "build_dir" -o \
-              -name "staging_dir" \) \
-              -exec echo "目录: {}" \; \
-              -exec ls -la {} \; || true
-            
-            # 4. 如果没有找到任何固件，复制整个项目用于调试
-            if [ -z "$(ls -A /openwrt/output)" ]; then
-              echo "⚠️ 未找到固件文件，复制整个项目用于调试"
-              mkdir -p /openwrt/debug
-              cp -rf /openwrt /debug/
-              echo "项目文件已复制到 /debug 目录"
-            fi
-            
-            # 5. 列出找到的文件
-            echo "=== 最终找到的固件文件 ==="
-            if [ -d "/openwrt/output" ] && [ "$(ls -A /openwrt/output)" ]; then
-              ls -la /openwrt/output/
-              echo "文件数量: $(ls -A /openwrt/output | wc -l)"
-            else
-              echo "❌ 没有找到任何固件文件"
-            fi
-            echo "================================"
-          '
+          # 使用单独的脚本文件来避免引号嵌套问题
+          cat > /home/openwrt/compile.sh << 'EOF_COMPILE'
+          #!/bin/bash
+          set -exuo pipefail
+          
+          cd /openwrt
+          
+          # 重写 feeds.conf
+          cat > feeds.conf << "EOF"
+          src-git packages https://github.com/openwrt/packages.git^0b0ec2fce2974e6f74a8de342957cba6e186d924
+          src-git luci https://github.com/openwrt/luci.git^79cf66900e038f0d03376edc7033c385030a5222
+          src-git routing https://github.com/openwrt-routing/packages.git^bb289e1f913f4509cb1a61d06f6eeb4c560adcec
+          EOF
+          
+          retry ./scripts/feeds update -a
+          ./scripts/feeds install luci luci-app-qos luci-app-ddns ddns-scripts
+          
+          cat > .config << "EOF"
+          CONFIG_TARGET_ramips=y
+          CONFIG_TARGET_ramips_mt76x8=y
+          CONFIG_TARGET_ramips_mt76x8_DEVICE_mt7688=y
+          CONFIG_TARGET_OPTIONS=y
+          CONFIG_TARGET_OPTIONS_BAUDRATE_115200=y
+          CONFIG_KERNEL_BRIDGE=y
+          CONFIG_KERNEL_VLAN_8021Q=y
+          CONFIG_PACKAGE_dnsmasq=y
+          CONFIG_PACKAGE_iptables=y
+          CONFIG_PACKAGE_iptables-mod-nat=y
+          CONFIG_PACKAGE_kmod-rt2800-soc=y
+          CONFIG_PACKAGE_wpad-mini=y
+          CONFIG_PACKAGE_hostapd-mini=y
+          CONFIG_PACKAGE_kmod-usb-core=y
+          CONFIG_PACKAGE_kmod-usb-ohci=y
+          CONFIG_PACKAGE_kmod-usb-storage=y
+          CONFIG_PACKAGE_kmod-usb2=y
+          CONFIG_PACKAGE_kmod-sdio=y
+          CONFIG_PACKAGE_kmod-mmc=y
+          CONFIG_PACKAGE_kmod-tun=y
+          CONFIG_PACKAGE_kmod-sched=y
+          CONFIG_PACKAGE_luci-app-qos=y
+          CONFIG_PACKAGE_ddns-scripts=y
+          CONFIG_PACKAGE_luci-app-ddns=y
+          CONFIG_PACKAGE_luci=y
+          CONFIG_PACKAGE_luci-mod-admin-full=y
+          CONFIG_TARGET_ROOTFS_SQUASHFS=y
+          CONFIG_PACKAGE_ipv6=n
+          CONFIG_PACKAGE_kmod-ipv6=n
+          CONFIG_PACKAGE_samba36=n
+          CONFIG_PACKAGE_miniupnpd=n
+          EOF
+          
+          echo "========== .config =========="
+          cat .config
+          echo "=============================="
+          
+          make defconfig
+          retry make download V=s
+          
+          echo "开始编译，首次编译约 1.5-2 小时..."
+          echo "编译开始时间: $(date)"
+          start_time=$(date +%s)
+          
+          # 使用 time 命令记录编译时间
+          make -j4 V=s 2>&1 | tee build.log
+          make_status=${PIPESTATUS[0]}  # 获取 make 命令的退出状态
+          
+          end_time=$(date +%s)
+          compile_time=$((end_time - start_time))
+          echo "编译结束时间: $(date)"
+          echo "编译耗时: $((compile_time / 60)) 分钟 $((compile_time % 60)) 秒"
+          
+          # 检查 make 命令是否成功
+          if [ $make_status -ne 0 ]; then
+            echo "❌ make 命令失败，退出码: $make_status"
+            exit $make_status
+          fi
+          
+          # 检查固件是否生成
+          firmware_count=$(find /openwrt/bin -type f \( -name "*.bin" -o -name "*.trx" -o -name "*.img" \) 2>/dev/null | wc -l)
+          if [ $firmware_count -eq 0 ]; then
+            echo "❌ 编译完成但未找到固件文件"
+            # 收集调试信息
+            mkdir -p /openwrt/debug
+            find /openwrt -type d -name "bin" -exec ls -la {} \; > /openwrt/debug/bin_dirs.txt
+            find /openwrt -type f -name "*.log" -exec cp {} /openwrt/debug/ \; 2>/dev/null || true
+            cp build.log /openwrt/debug/
+            exit 1
+          fi
+          
+          echo "✅ 编译成功，找到 $firmware_count 个固件文件"
+          
+          # 收集固件文件
+          mkdir -p /openwrt/output
+          find /openwrt/bin -type f \( \
+            -name "*.bin" -o \
+            -name "*.trx" -o \
+            -name "*.img" -o \
+            -name "*squashfs*" -o \
+            -name "*sysupgrade*" -o \
+            -name "*factory*" \) \
+            -exec cp -v {} /openwrt/output/ \;
+          
+          echo "固件文件列表:"
+          ls -la /openwrt/output/
+          echo "================================"
+          EOF_COMPILE
+          
+          chmod +x /home/openwrt/compile.sh
+          chown openwrt:openwrt /home/openwrt/compile.sh
+          
+          # 切换到普通用户执行编译脚本
+          su - openwrt -c "/home/openwrt/compile.sh"
+          compile_status=$?
+          
+          if [ $compile_status -ne 0 ]; then
+            echo "❌ 编译脚本失败，退出码: $compile_status"
+            exit $compile_status
+          fi
+          
+          echo "✅ 编译脚本成功完成"
           EOF_SCRIPT
           
           for i in {1..3}; do
             echo "尝试第 $i 次编译..."
             docker rm -f openwrt-build 2>/dev/null || true
+            
+            # 记录开始时间
+            build_start=$(date +%s)
             
             docker run --name openwrt-build \
               --privileged \
@@ -216,77 +225,53 @@ jobs:
               -v ${{ github.workspace }}/build_script.sh:/build_script.sh \
               ubuntu:12.04 /bin/bash /build_script.sh
             
-            if [ $? -eq 0 ]; then
+            build_status=$?
+            build_end=$(date +%s)
+            build_duration=$((build_end - build_start))
+            
+            echo "第 $i 次编译耗时: $((build_duration / 60)) 分钟 $((build_duration % 60)) 秒"
+            
+            if [ $build_status -eq 0 ]; then
               echo "✅ 编译成功"
               exit 0
             else
-              echo "❌ 第 $i 次尝试失败"
+              echo "❌ 第 $i 次尝试失败，退出码: $build_status"
+              # 如果编译时间太短（<30分钟），肯定是假的成功
+              if [ $build_duration -lt 1800 ]; then
+                echo "⚠️ 编译时间异常（<30分钟），疑似编译未真正执行"
+              fi
               [ $i -lt 3 ] && sleep 5
             fi
           done
           exit 1
 
-      - name: 全面收集编译产物
+      - name: 收集所有编译产物
         if: always()
         run: |
-          # 创建输出目录
-          mkdir -p ${{ github.workspace }}/firmware ${{ github.workspace }}/logs ${{ github.workspace }}/debug
+          mkdir -p ${{ github.workspace }}/artifacts/{firmware,logs,debug}
           
-          # 1. 尝试从 output 目录复制
-          echo "尝试从 /openwrt/output 复制..."
-          docker cp openwrt-build:/openwrt/output/. ${{ github.workspace }}/firmware/ 2>/dev/null || echo "No files in /openwrt/output"
+          # 复制固件
+          docker cp openwrt-build:/openwrt/output/. ${{ github.workspace }}/artifacts/firmware/ 2>/dev/null || echo "No firmware"
+          docker cp openwrt-build:/openwrt/bin/. ${{ github.workspace }}/artifacts/firmware/ 2>/dev/null || echo "No bin"
           
-          # 2. 尝试从 debug 目录复制（如果存在）
-          echo "尝试从 /debug 复制..."
-          docker cp openwrt-build:/debug/. ${{ github.workspace }}/debug/ 2>/dev/null || echo "No debug directory"
+          # 复制日志
+          docker cp openwrt-build:/openwrt/build.log ${{ github.workspace }}/artifacts/logs/ 2>/dev/null || echo "No build.log"
+          docker cp openwrt-build:/openwrt/debug/. ${{ github.workspace }}/artifacts/debug/ 2>/dev/null || echo "No debug"
           
-          # 3. 尝试复制整个项目结构
-          echo "尝试复制整个 openwrt 目录..."
-          docker cp openwrt-build:/openwrt ${{ github.workspace }}/full_source/ 2>/dev/null || echo "Failed to copy full source"
+          # 复制编译脚本的输出
+          docker cp openwrt-build:/home/openwrt/compile.sh ${{ github.workspace }}/artifacts/logs/ 2>/dev/null || true
           
-          # 4. 复制日志文件
-          for file in build.log .config feeds.conf; do
-            docker cp openwrt-build:/openwrt/$file ${{ github.workspace }}/logs/ 2>/dev/null || echo "No $file"
-          done
+          sudo chown -R $USER:$USER ${{ github.workspace }}/artifacts 2>/dev/null || true
           
-          # 修复权限
-          sudo chown -R $USER:$USER ${{ github.workspace }}/firmware ${{ github.workspace }}/logs ${{ github.workspace }}/debug ${{ github.workspace }}/full_source 2>/dev/null || true
-          
-          # 5. 显示收集结果
           echo "========== 收集结果 =========="
-          echo "firmware 目录:"
-          ls -la ${{ github.workspace }}/firmware || echo "空"
-          echo "logs 目录:"
-          ls -la ${{ github.workspace }}/logs || echo "空"
-          echo "debug 目录:"
-          ls -la ${{ github.workspace }}/debug || echo "空"
+          ls -la ${{ github.workspace }}/artifacts/
           echo "=============================="
 
-      - name: 上传固件
+      - name: 上传编译产物
         uses: actions/upload-artifact@v4
         with:
-          name: openwrt-firmware-${{ github.run_id }}
-          path: |
-            firmware/
-            debug/
-          retention-days: 30
-          if-no-files-found: warn
-
-      - name: 上传完整源码（调试用）
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: openwrt-full-source-${{ github.run_id }}
-          path: full_source/
-          retention-days: 7
-          if-no-files-found: warn
-
-      - name: 上传构建日志
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: build-logs-${{ github.run_id }}
-          path: logs/
+          name: openwrt-build-artifacts-${{ github.run_id }}
+          path: artifacts/
           retention-days: 30
 
       - name: 清理容器
