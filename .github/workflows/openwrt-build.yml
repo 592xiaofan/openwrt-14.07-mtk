@@ -35,12 +35,10 @@ jobs:
       - name: 在 Ubuntu 12.04 容器中编译
         id: build
         run: |
-          # 创建编译脚本
           cat > build_script.sh << 'EOF_SCRIPT'
           #!/bin/bash
           set -ex
           
-          # 网络重试函数
           retry() {
             local n=1
             local max=3
@@ -59,16 +57,13 @@ jobs:
             done
           }
           
-          # 换源函数
           update_source() {
-            # 尝试 old-releases 源
             sed -i 's/archive.ubuntu.com/old-releases.ubuntu.com/g' /etc/apt/sources.list
             sed -i 's/security.ubuntu.com/old-releases.ubuntu.com/g' /etc/apt/sources.list
             if retry apt-get update; then
               return 0
             fi
             
-            # 如果失败，尝试 163 源
             echo "尝试备用源 163..."
             cat > /etc/apt/sources.list << 'EOF'
           deb http://mirrors.163.com/ubuntu/ precise main universe restricted multiverse
@@ -79,26 +74,21 @@ jobs:
             retry apt-get update
           }
           
-          # 安装依赖
           install_deps() {
             retry apt-get install -y build-essential subversion libncurses5-dev zlib1g-dev gawk \
-              gcc-multilib flex git-core gettext libssl-dev unzip python2.7 file wget curl
+              gcc-multilib flex git-core gettext libssl-dev unzip python2.7 file wget curl \
+              tree  # 添加 tree 命令方便查看目录结构
           }
           
-          # 更新源并安装依赖
           update_source
           install_deps
           
           echo "=== GCC Version ==="
           gcc --version | head -1
           
-          # 创建普通用户
           useradd -m openwrt
-          
-          # 设置源码目录权限
           chown -R openwrt:openwrt /openwrt
           
-          # 切换到普通用户执行编译
           su - openwrt -c '
             cd /openwrt
             
@@ -109,11 +99,9 @@ jobs:
             src-git routing https://github.com/openwrt-routing/packages.git^bb289e1f913f4509cb1a61d06f6eeb4c560adcec
             EOF
             
-            # 更新 feeds
             retry ./scripts/feeds update -a
             ./scripts/feeds install luci luci-app-qos luci-app-ddns ddns-scripts
             
-            # 写入 .config
             cat > .config << "EOF"
             CONFIG_TARGET_ramips=y
             CONFIG_TARGET_ramips_mt76x8=y
@@ -152,52 +140,75 @@ jobs:
             cat .config
             echo "=============================="
             
-            # 生成配置并编译
             make defconfig
-            
-            # 下载源码（带重试）
             retry make download V=s
             
             echo "开始编译，首次编译约 1.5-2 小时..."
             make -j4 V=s 2>&1 | tee build.log
             
-            # ========== 修复：更精确地查找固件文件 ==========
-            echo "========== 查找固件文件 =========="
+            # ========== 全面的固件查找 ==========
+            echo "========== 开始全面查找固件文件 =========="
             
             # 创建输出目录
             mkdir -p /openwrt/output
             
-            # 查找所有可能的固件文件并复制到统一目录
-            find /openwrt/bin -type f \( \
+            # 1. 显示完整的目录结构
+            echo "=== 查看 /openwrt 目录结构 ==="
+            ls -la /openwrt/
+            
+            echo "=== 查看 /openwrt/bin 目录（如果存在）==="
+            if [ -d "/openwrt/bin" ]; then
+              ls -la /openwrt/bin/
+              tree /openwrt/bin/ -L 3 || true
+            else
+              echo "/openwrt/bin 目录不存在"
+            fi
+            
+            # 2. 在整个文件系统中搜索固件文件
+            echo "=== 在整个 /openwrt 中搜索固件文件 ==="
+            find /openwrt -type f \( \
               -name "*.bin" -o \
               -name "*.trx" -o \
               -name "*.img" -o \
               -name "*squashfs*" -o \
               -name "*sysupgrade*" -o \
               -name "*factory*" \) \
-              -exec cp -v {} /openwrt/output/ \;
+              -exec ls -lh {} \; \
+              -exec cp {} /openwrt/output/ \;
             
-            # 如果 output 目录为空，则复制整个 bin 目录
+            # 3. 搜索所有可能的编译输出目录
+            echo "=== 搜索常见的编译输出目录 ==="
+            find /openwrt -type d \( \
+              -name "bin" -o \
+              -name "build_dir" -o \
+              -name "staging_dir" \) \
+              -exec echo "目录: {}" \; \
+              -exec ls -la {} \; || true
+            
+            # 4. 如果没有找到任何固件，复制整个项目用于调试
             if [ -z "$(ls -A /openwrt/output)" ]; then
-              echo "未找到固件文件，复制整个 bin 目录"
-              cp -rf /openwrt/bin /openwrt/output/
+              echo "⚠️ 未找到固件文件，复制整个项目用于调试"
+              mkdir -p /openwrt/debug
+              cp -rf /openwrt /debug/
+              echo "项目文件已复制到 /debug 目录"
             fi
             
-            # 列出找到的文件
-            echo "找到的固件文件："
-            ls -la /openwrt/output/
-            echo "======================================"
+            # 5. 列出找到的文件
+            echo "=== 最终找到的固件文件 ==="
+            if [ -d "/openwrt/output" ] && [ "$(ls -A /openwrt/output)" ]; then
+              ls -la /openwrt/output/
+              echo "文件数量: $(ls -A /openwrt/output | wc -l)"
+            else
+              echo "❌ 没有找到任何固件文件"
+            fi
+            echo "================================"
           '
           EOF_SCRIPT
           
-          # 重试机制运行容器
           for i in {1..3}; do
             echo "尝试第 $i 次编译..."
-            
-            # 清理旧容器
             docker rm -f openwrt-build 2>/dev/null || true
             
-            # 运行容器
             docker run --name openwrt-build \
               --privileged \
               -e TZ=Asia/Shanghai \
@@ -210,62 +221,63 @@ jobs:
               exit 0
             else
               echo "❌ 第 $i 次尝试失败"
-              if [ $i -lt 3 ]; then
-                echo "5秒后重试..."
-                sleep 5
-              fi
+              [ $i -lt 3 ] && sleep 5
             fi
           done
-          
-          echo "所有重试都失败了"
           exit 1
 
-      - name: 从容器复制固件（修复版）
+      - name: 全面收集编译产物
         if: always()
         run: |
           # 创建输出目录
-          mkdir -p ${{ github.workspace }}/firmware ${{ github.workspace }}/logs
+          mkdir -p ${{ github.workspace }}/firmware ${{ github.workspace }}/logs ${{ github.workspace }}/debug
           
-          # 尝试从 output 目录复制
+          # 1. 尝试从 output 目录复制
           echo "尝试从 /openwrt/output 复制..."
           docker cp openwrt-build:/openwrt/output/. ${{ github.workspace }}/firmware/ 2>/dev/null || echo "No files in /openwrt/output"
           
-          # 如果 output 为空，尝试直接从 bin 复制
-          if [ -z "$(ls -A ${{ github.workspace }}/firmware 2>/dev/null)" ]; then
-            echo "尝试从 /openwrt/bin 复制..."
-            docker cp openwrt-build:/openwrt/bin/. ${{ github.workspace }}/firmware/ 2>/dev/null || echo "No files in /openwrt/bin"
-          fi
+          # 2. 尝试从 debug 目录复制（如果存在）
+          echo "尝试从 /debug 复制..."
+          docker cp openwrt-build:/debug/. ${{ github.workspace }}/debug/ 2>/dev/null || echo "No debug directory"
           
-          # 复制构建日志
-          docker cp openwrt-build:/openwrt/build.log ${{ github.workspace }}/logs/ 2>/dev/null || echo "No build.log"
-          docker cp openwrt-build:/openwrt/.config ${{ github.workspace }}/logs/config.txt 2>/dev/null || true
+          # 3. 尝试复制整个项目结构
+          echo "尝试复制整个 openwrt 目录..."
+          docker cp openwrt-build:/openwrt ${{ github.workspace }}/full_source/ 2>/dev/null || echo "Failed to copy full source"
+          
+          # 4. 复制日志文件
+          for file in build.log .config feeds.conf; do
+            docker cp openwrt-build:/openwrt/$file ${{ github.workspace }}/logs/ 2>/dev/null || echo "No $file"
+          done
           
           # 修复权限
-          sudo chown -R $USER:$USER ${{ github.workspace }}/firmware ${{ github.workspace }}/logs 2>/dev/null || true
+          sudo chown -R $USER:$USER ${{ github.workspace }}/firmware ${{ github.workspace }}/logs ${{ github.workspace }}/debug ${{ github.workspace }}/full_source 2>/dev/null || true
           
-          # 显示找到的文件
-          echo "========== 最终找到的固件文件 =========="
-          find ${{ github.workspace }}/firmware -type f -name "*.bin" -o -name "*.trx" -o -name "*.img" 2>/dev/null | head -20 || echo "未找到固件文件"
-          echo "========================================"
+          # 5. 显示收集结果
+          echo "========== 收集结果 =========="
+          echo "firmware 目录:"
+          ls -la ${{ github.workspace }}/firmware || echo "空"
+          echo "logs 目录:"
+          ls -la ${{ github.workspace }}/logs || echo "空"
+          echo "debug 目录:"
+          ls -la ${{ github.workspace }}/debug || echo "空"
+          echo "=============================="
 
       - name: 上传固件
         uses: actions/upload-artifact@v4
         with:
-          name: openwrt-14.07-mt7688-firmware-${{ github.run_id }}
+          name: openwrt-firmware-${{ github.run_id }}
           path: |
-            firmware/**/*.bin
-            firmware/**/*.trx
-            firmware/**/*.img
-            firmware/**/*.squashfs*
+            firmware/
+            debug/
           retention-days: 30
           if-no-files-found: warn
 
-      - name: 上传完整构建输出（调试用）
+      - name: 上传完整源码（调试用）
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: full-build-output-${{ github.run_id }}
-          path: firmware/
+          name: openwrt-full-source-${{ github.run_id }}
+          path: full_source/
           retention-days: 7
           if-no-files-found: warn
 
