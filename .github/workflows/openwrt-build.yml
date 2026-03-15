@@ -1,281 +1,168 @@
-name: Build OpenWrt 14.07-mtk for MT7688
+name: Build OpenWrt 23.05 for MT7688 (Official SDK)
 
 on:
   workflow_dispatch:
+  # schedule:
+  #   - cron: '0 0 * * 0'  # 每周日自动构建（可选）
+
+env:
+  OPENWRT_VERSION: 23.05.5
+  TARGET: ramips/mt76x8
+  SDK_URL: https://downloads.openwrt.org/releases/23.05.5/targets/ramips/mt76x8/openwrt-sdk-23.05.5-ramips-mt76x8_gcc-12.3.0_musl.Linux-x86_64.tar.xz
+  # 官方SDK地址 [citation:1]
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     permissions:
       contents: write
       actions: write
 
     steps:
-      - name: Checkout source
-        uses: actions/checkout@v4
-        with:
-          path: openwrt
-          fetch-depth: 1
-
-      - name: 设置 Docker 镜像加速
+      - name: 最大程度优化磁盘空间 (Maximize Build Space)
         run: |
-          sudo mkdir -p /etc/docker
-          sudo tee /etc/docker/daemon.json <<'EOF'
-          {
-            "registry-mirrors": [
-              "https://docker.mirrors.ustc.edu.cn",
-              "https://hub-mirror.c.163.com",
-              "https://mirror.baidubce.com"
-            ]
-          }
-          EOF
-          sudo systemctl restart docker || true
-          sleep 5
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /opt/ghc
+          sudo rm -rf "/usr/local/share/boost"
+          sudo rm -rf "$AGENT_TOOLSDIRECTORY"
+          df -h
 
-      - name: 在 Ubuntu 12.04 容器中编译
+      - name: 安装构建依赖 (Install Dependencies)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential clang flex bison g++ gawk gcc-multilib \
+            g++-multilib gettext git libncurses5-dev libssl-dev python3-distutils \
+            rsync unzip zlib1g-dev file wget subversion
+          sudo apt-get autoremove -y
+          sudo apt-get clean
+
+      - name: 下载并解压官方SDK (Download Official SDK)
+        run: |
+          echo "SDK下载地址: ${{ env.SDK_URL }}"
+          wget -q --show-progress --progress=bar:force:noscroll ${{ env.SDK_URL }}
+          tar -xf openwrt-sdk-*.tar.xz
+          mv openwrt-sdk-* openwrt
+          cd openwrt
+          echo "SDK路径: ${{ github.workspace }}/openwrt" >> $GITHUB_ENV
+          pwd
+
+      - name: 记录SDK信息 (Record SDK Info for Future Driver Compilation)
+        run: |
+          echo "==================== SDK 信息 ===================="
+          echo "SDK下载地址: ${{ env.SDK_URL }}"
+          echo "工具链路径: ${{ github.workspace }}/openwrt/staging_dir/toolchain-mipsel_24kc_gcc-12.3.0_musl"
+          echo "内核头文件路径: ${{ github.workspace }}/openwrt/build_dir/target-mipsel_24kc_musl/linux-ramips_mt76x8/linux-5.15.162"
+          echo "编译器前缀: mipsel-openwrt-linux-"
+          echo "=================================================="
+          echo "SDK_INFO=${{ env.SDK_URL }}" >> $GITHUB_ENV
+
+      - name: 更新 Feeds (Update Feeds)
+        run: |
+          cd openwrt
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+      - name: 生成配置文件 (Generate .config)
+        run: |
+          cd openwrt
+          # 选择目标平台和设备 [citation:2]
+          echo "CONFIG_TARGET_ramips=y" >> .config
+          echo "CONFIG_TARGET_ramips_mt76x8=y" >> .config
+          echo "CONFIG_TARGET_ramips_mt76x8_DEVICE_hiwifi_hc5661a=y" >> .config
+          
+          # 设置串口波特率为115200 [citation:5]
+          echo "CONFIG_TARGET_OPTIONS=y" >> .config
+          echo "CONFIG_TARGET_OPTIONS_BAUDRATE_115200=y" >> .config
+          
+          # 内核符号导出（确保ko模块能加载） [基于历史分析]
+          echo "CONFIG_KERNEL_KALLSYMS=y" >> .config
+          echo "CONFIG_KERNEL_KALLSYMS_ALL=y" >> .config
+          echo "CONFIG_KERNEL_MODVERSIONS=y" >> .config
+          
+          # 硬件配置：32M Flash / 128M RAM [根据用户要求]
+          echo "CONFIG_TARGET_KERNEL_PARTSIZE=16" >> .config
+          echo "CONFIG_TARGET_ROOTFS_PARTSIZE=120" >> .config
+          
+          # 集成常用软件包 [基于用户要求]
+          echo "CONFIG_PACKAGE_ddns-scripts=y" >> .config
+          echo "CONFIG_PACKAGE_luci-app-ddns=y" >> .config
+          echo "CONFIG_PACKAGE_luci-app-qos=y" >> .config
+          echo "CONFIG_PACKAGE_v2raya=y" >> .config
+          echo "CONFIG_PACKAGE_vsftpd=y" >> .config  # FTP服务器
+          echo "CONFIG_PACKAGE_luci-app-vsftpd=y" >> .config
+          
+          # 确保LuCI界面完整
+          echo "CONFIG_PACKAGE_luci=y" >> .config
+          echo "CONFIG_PACKAGE_luci-ssl=y" >> .config
+          
+          # 扩展软件包（可选，可根据需要增删）
+          echo "CONFIG_PACKAGE_openssh-sftp-server=y" >> .config
+          echo "CONFIG_PACKAGE_tcpdump=y" >> .config
+          
+          # 生成完整配置
+          make defconfig
+          
+          # 打印最终配置以供检查
+          ./scripts/diffconfig.sh
+
+      - name: 下载源码包 (Download Source Packages)
+        run: |
+          cd openwrt
+          make download -j$(nproc)
+          find dl -size -1024c -exec ls -l {} \;
+
+      - name: 编译固件 (Compile Firmware)
         id: build
         run: |
-          cat > build_script.sh << 'EOF_SCRIPT'
-          #!/bin/bash
-          set -exuo pipefail  # 添加 pipefail，确保管道命令中的错误会被捕获
+          cd openwrt
+          # 使用-j参数并行编译，提高速度
+          make -j$(nproc) || make -j1 V=s
           
-          retry() {
-            local n=1
-            local max=3
-            local delay=5
-            while true; do
-              "$@" && break || {
-                if [[ $n -lt $max ]]; then
-                  ((n++))
-                  echo "Command failed. Attempt $n/$max:"
-                  sleep $delay
-                else
-                  echo "The command has failed after $n attempts."
-                  return 1
-                fi
-              }
-            done
-          }
-          
-          update_source() {
-            sed -i 's/archive.ubuntu.com/old-releases.ubuntu.com/g' /etc/apt/sources.list
-            sed -i 's/security.ubuntu.com/old-releases.ubuntu.com/g' /etc/apt/sources.list
-            if retry apt-get update; then
-              return 0
-            fi
-            
-            echo "尝试备用源 163..."
-            cat > /etc/apt/sources.list << 'EOF'
-          deb http://mirrors.163.com/ubuntu/ precise main universe restricted multiverse
-          deb http://mirrors.163.com/ubuntu/ precise-security main universe restricted multiverse
-          deb http://mirrors.163.com/ubuntu/ precise-updates main universe restricted multiverse
-          deb http://mirrors.163.com/ubuntu/ precise-backports main universe restricted multiverse
-          EOF
-            retry apt-get update
-          }
-          
-          install_deps() {
-            retry apt-get install -y build-essential subversion libncurses5-dev zlib1g-dev gawk \
-              gcc-multilib flex git-core gettext libssl-dev unzip python2.7 file wget curl \
-              tree time
-          }
-          
-          update_source
-          install_deps
-          
-          echo "=== GCC Version ==="
-          gcc --version | head -1
-          
-          useradd -m openwrt
-          chown -R openwrt:openwrt /openwrt
-          
-          # 使用单独的脚本文件来避免引号嵌套问题
-          cat > /home/openwrt/compile.sh << 'EOF_COMPILE'
-          #!/bin/bash
-          set -exuo pipefail
-          
-          cd /openwrt
-          
-          # 重写 feeds.conf
-          cat > feeds.conf << "EOF"
-          src-git packages https://github.com/openwrt/packages.git^0b0ec2fce2974e6f74a8de342957cba6e186d924
-          src-git luci https://github.com/openwrt/luci.git^79cf66900e038f0d03376edc7033c385030a5222
-          src-git routing https://github.com/openwrt-routing/packages.git^bb289e1f913f4509cb1a61d06f6eeb4c560adcec
-          EOF
-          
-          retry ./scripts/feeds update -a
-          ./scripts/feeds install luci luci-app-qos luci-app-ddns ddns-scripts
-          
-          cat > .config << "EOF"
-          CONFIG_TARGET_ramips=y
-          CONFIG_TARGET_ramips_mt76x8=y
-          CONFIG_TARGET_ramips_mt76x8_DEVICE_mt7688=y
-          CONFIG_TARGET_OPTIONS=y
-          CONFIG_TARGET_OPTIONS_BAUDRATE_115200=y
-          CONFIG_KERNEL_BRIDGE=y
-          CONFIG_KERNEL_VLAN_8021Q=y
-          CONFIG_PACKAGE_dnsmasq=y
-          CONFIG_PACKAGE_iptables=y
-          CONFIG_PACKAGE_iptables-mod-nat=y
-          CONFIG_PACKAGE_kmod-rt2800-soc=y
-          CONFIG_PACKAGE_wpad-mini=y
-          CONFIG_PACKAGE_hostapd-mini=y
-          CONFIG_PACKAGE_kmod-usb-core=y
-          CONFIG_PACKAGE_kmod-usb-ohci=y
-          CONFIG_PACKAGE_kmod-usb-storage=y
-          CONFIG_PACKAGE_kmod-usb2=y
-          CONFIG_PACKAGE_kmod-sdio=y
-          CONFIG_PACKAGE_kmod-mmc=y
-          CONFIG_PACKAGE_kmod-tun=y
-          CONFIG_PACKAGE_kmod-sched=y
-          CONFIG_PACKAGE_luci-app-qos=y
-          CONFIG_PACKAGE_ddns-scripts=y
-          CONFIG_PACKAGE_luci-app-ddns=y
-          CONFIG_PACKAGE_luci=y
-          CONFIG_PACKAGE_luci-mod-admin-full=y
-          CONFIG_TARGET_ROOTFS_SQUASHFS=y
-          CONFIG_PACKAGE_ipv6=n
-          CONFIG_PACKAGE_kmod-ipv6=n
-          CONFIG_PACKAGE_samba36=n
-          CONFIG_PACKAGE_miniupnpd=n
-          EOF
-          
-          echo "========== .config =========="
-          cat .config
-          echo "=============================="
-          
-          make defconfig
-          retry make download V=s
-          
-          echo "开始编译，首次编译约 1.5-2 小时..."
-          echo "编译开始时间: $(date)"
-          start_time=$(date +%s)
-          
-          # 使用 time 命令记录编译时间
-          make -j4 V=s 2>&1 | tee build.log
-          make_status=${PIPESTATUS[0]}  # 获取 make 命令的退出状态
-          
-          end_time=$(date +%s)
-          compile_time=$((end_time - start_time))
-          echo "编译结束时间: $(date)"
-          echo "编译耗时: $((compile_time / 60)) 分钟 $((compile_time % 60)) 秒"
-          
-          # 检查 make 命令是否成功
-          if [ $make_status -ne 0 ]; then
-            echo "❌ make 命令失败，退出码: $make_status"
-            exit $make_status
-          fi
-          
-          # 检查固件是否生成
-          firmware_count=$(find /openwrt/bin -type f \( -name "*.bin" -o -name "*.trx" -o -name "*.img" \) 2>/dev/null | wc -l)
-          if [ $firmware_count -eq 0 ]; then
-            echo "❌ 编译完成但未找到固件文件"
-            # 收集调试信息
-            mkdir -p /openwrt/debug
-            find /openwrt -type d -name "bin" -exec ls -la {} \; > /openwrt/debug/bin_dirs.txt
-            find /openwrt -type f -name "*.log" -exec cp {} /openwrt/debug/ \; 2>/dev/null || true
-            cp build.log /openwrt/debug/
-            exit 1
-          fi
-          
-          echo "✅ 编译成功，找到 $firmware_count 个固件文件"
-          
-          # 收集固件文件
-          mkdir -p /openwrt/output
-          find /openwrt/bin -type f \( \
-            -name "*.bin" -o \
-            -name "*.trx" -o \
-            -name "*.img" -o \
-            -name "*squashfs*" -o \
-            -name "*sysupgrade*" -o \
-            -name "*factory*" \) \
-            -exec cp -v {} /openwrt/output/ \;
-          
-          echo "固件文件列表:"
-          ls -la /openwrt/output/
-          echo "================================"
-          EOF_COMPILE
-          
-          chmod +x /home/openwrt/compile.sh
-          chown openwrt:openwrt /home/openwrt/compile.sh
-          
-          # 切换到普通用户执行编译脚本
-          su - openwrt -c "/home/openwrt/compile.sh"
-          compile_status=$?
-          
-          if [ $compile_status -ne 0 ]; then
-            echo "❌ 编译脚本失败，退出码: $compile_status"
-            exit $compile_status
-          fi
-          
-          echo "✅ 编译脚本成功完成"
-          EOF_SCRIPT
-          
-          for i in {1..3}; do
-            echo "尝试第 $i 次编译..."
-            docker rm -f openwrt-build 2>/dev/null || true
-            
-            # 记录开始时间
-            build_start=$(date +%s)
-            
-            docker run --name openwrt-build \
-              --privileged \
-              -e TZ=Asia/Shanghai \
-              -v ${{ github.workspace }}/openwrt:/openwrt \
-              -v ${{ github.workspace }}/build_script.sh:/build_script.sh \
-              ubuntu:12.04 /bin/bash /build_script.sh
-            
-            build_status=$?
-            build_end=$(date +%s)
-            build_duration=$((build_end - build_start))
-            
-            echo "第 $i 次编译耗时: $((build_duration / 60)) 分钟 $((build_duration % 60)) 秒"
-            
-            if [ $build_status -eq 0 ]; then
-              echo "✅ 编译成功"
-              exit 0
-            else
-              echo "❌ 第 $i 次尝试失败，退出码: $build_status"
-              # 如果编译时间太短（<30分钟），肯定是假的成功
-              if [ $build_duration -lt 1800 ]; then
-                echo "⚠️ 编译时间异常（<30分钟），疑似编译未真正执行"
-              fi
-              [ $i -lt 3 ] && sleep 5
-            fi
+          # 查找生成的固件文件
+          echo "========== 生成的固件文件 =========="
+          find bin/targets/ -name "*squashfs*" -o -name "*sysupgrade*" -o -name "*factory*" | while read line; do
+            echo "找到固件: $line"
+            ls -lh $line
           done
-          exit 1
+          
+          # 记录固件路径用于后续上传
+          echo "firmware_path=$(find bin/targets/ -name "*sysupgrade*" | head -1)" >> $GITHUB_OUTPUT
 
-      - name: 收集所有编译产物
+      - name: 准备固件上传 (Prepare Firmware Upload)
         if: always()
         run: |
-          mkdir -p ${{ github.workspace }}/artifacts/{firmware,logs,debug}
-          
-          # 复制固件
-          docker cp openwrt-build:/openwrt/output/. ${{ github.workspace }}/artifacts/firmware/ 2>/dev/null || echo "No firmware"
-          docker cp openwrt-build:/openwrt/bin/. ${{ github.workspace }}/artifacts/firmware/ 2>/dev/null || echo "No bin"
-          
-          # 复制日志
-          docker cp openwrt-build:/openwrt/build.log ${{ github.workspace }}/artifacts/logs/ 2>/dev/null || echo "No build.log"
-          docker cp openwrt-build:/openwrt/debug/. ${{ github.workspace }}/artifacts/debug/ 2>/dev/null || echo "No debug"
-          
-          # 复制编译脚本的输出
-          docker cp openwrt-build:/home/openwrt/compile.sh ${{ github.workspace }}/artifacts/logs/ 2>/dev/null || true
-          
-          sudo chown -R $USER:$USER ${{ github.workspace }}/artifacts 2>/dev/null || true
-          
-          echo "========== 收集结果 =========="
-          ls -la ${{ github.workspace }}/artifacts/
-          echo "=============================="
+          mkdir -p ${{ github.workspace }}/firmware_output
+          cp -rf openwrt/bin/targets/* ${{ github.workspace }}/firmware_output/ || true
+          cp openwrt/.config ${{ github.workspace }}/firmware_output/config.txt
+          echo "固件已复制到 firmware_output 目录"
 
-      - name: 上传编译产物
+      - name: 上传固件 (Upload Firmware Artifacts)
         uses: actions/upload-artifact@v4
         with:
-          name: openwrt-build-artifacts-${{ github.run_id }}
-          path: artifacts/
+          name: openwrt-23.05-mt7688-firmware
+          path: |
+            firmware_output/
           retention-days: 30
+          if-no-files-found: warn
 
-      - name: 清理容器
-        if: always()
+      - name: 上传SDK信息 (Upload SDK Info for Future Use)
+        uses: actions/upload-artifact@v4
+        with:
+          name: sdk-info
+          path: |
+            ${{ github.workspace }}/sdk_info.txt
+          retention-days: 90
         run: |
-          docker rm -f openwrt-build 2>/dev/null || true
-          rm -f build_script.sh
+          echo "SDK Download URL: ${{ env.SDK_URL }}" > ${{ github.workspace }}/sdk_info.txt
+          echo "Toolchain Path: ${{ github.workspace }}/openwrt/staging_dir/toolchain-mipsel_24kc_gcc-12.3.0_musl" >> ${{ github.workspace }}/sdk_info.txt
+          echo "Kernel Headers: ${{ github.workspace }}/openwrt/build_dir/target-mipsel_24kc_musl/linux-ramips_mt76x8/linux-5.15.162" >> ${{ github.workspace }}/sdk_info.txt
+
+      - name: 上传构建日志 (Upload Build Logs)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs
+          path: |
+            openwrt/logs/
+            openwrt/build_dir/**/*.log
+          retention-days: 7
