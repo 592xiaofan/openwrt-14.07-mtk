@@ -26,7 +26,7 @@ jobs:
     steps:
       # step 1. 切到当前仓库
       - name: Checkout
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4  # 同时升级 checkout 到 v4（建议）
 
       # step 2. 清理空间和安装依赖
       - name: Space cleanup and install dependencies
@@ -281,7 +281,7 @@ jobs:
       # step 9. 创建 Release & 上传资源
       - name: Create Release and Upload Assets
         if: steps.compile.outputs.status == 'success'
-        uses: softprops/action-gh-release@v1
+        uses: softprops/action-gh-release@v2  # 同时升级 release 动作到 v2（兼容 artifact v4）
         with:
           name: OpenWrt 23.05 for MT7688 ${{ github.run_number }}
           tag_name: mt7688-${{ github.run_number }}
@@ -333,17 +333,18 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      # step 10. 上传固件作为 artifact（即使 release 失败也能保存）
+      # step 10. 上传固件作为 artifact（使用 v4）
       - name: Upload firmware artifacts
         if: always()
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4  # 关键修改：从 v3 升级到 v4
         with:
-          name: openwrt-23.05-mt7688-firmware
+          name: openwrt-23.05-mt7688-firmware-${{ github.run_id }}
           path: |
             ${{ github.workspace }}/firmware/
             ${{ github.workspace }}/config.txt
             ${{ github.workspace }}/build.log
           retention-days: 30
+          if-no-files-found: warn  # v4 新增选项，避免空目录导致失败
 
       # step 11. 获取时间（用于 release 标题）
       - name: Get current time
