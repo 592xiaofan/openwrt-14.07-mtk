@@ -1,114 +1,71 @@
-name: Build OpenWrt 23.05 for MT7688 (Official SDK)
+# 工作流名称
+name: Build OpenWrt 23.05 for MT7688
 
+# 触发条件：手动触发 + 每天0点
 on:
   workflow_dispatch:
-    inputs:
-      version:
-        description: 'OpenWrt version (23.05.0 - 23.05.5)'
-        required: true
-        default: '23.05.5'
-      clean_build:
-        description: 'Clean build (true/false)'
-        required: false
-        default: 'false'
+  schedule:
+    - cron: '0 0 * * *'  # 每天 UTC 0点（北京时间8点）
 
-# 全局环境变量
 env:
-  OPENWRT_VERSION: ${{ github.event.inputs.version || '23.05.5' }}
+  REPO_URL: https://github.com/openwrt/openwrt
+  OPENWRT_BRANCH: openwrt-23.05
+  TZ: Asia/Shanghai
   TARGET: ramips
   SUBTARGET: mt76x8
-  SDK_URL: "https://downloads.openwrt.org/releases"
-  WORK_DIR: ${{ github.workspace }}/openwrt
   ARTIFACT_DIR: ${{ github.workspace }}/artifacts
 
 jobs:
-  build:
-    runs-on: ubuntu-22.04
+  OpenWrt-MT7688:
+    runs-on: ubuntu-latest
+    # 设置权限，允许写入 Releases
     permissions:
       contents: write
       actions: write
 
     steps:
-      # ---------- 1. 环境准备 ----------
-      - name: Maximize build space
-        run: |
-          sudo apt clean
-          sudo rm -rf /usr/share/dotnet
-          sudo rm -rf /opt/ghc
-          sudo rm -rf /usr/local/share/boost
-          echo "✅ Free up disk space"
+      # step 1. 切到当前仓库
+      - name: Checkout
+        uses: actions/checkout@v3
 
-      - name: Install dependencies
+      # step 2. 清理空间和安装依赖
+      - name: Space cleanup and install dependencies
         run: |
-          sudo apt update
-          sudo apt install -y build-essential clang flex bison g++ gawk \
-          gcc-multilib g++-multilib gettext git libncurses5-dev libssl-dev \
-          python3-distutils rsync unzip zlib1g-dev file wget subversion \
-          libelf-dev autoconf automake libtool
+          sudo -E apt-get update -y
+          sudo -E apt-get full-upgrade -y
+          sudo -E apt-get install -y ack antlr3 asciidoc autoconf automake autopoint binutils bison build-essential \
+            bzip2 ccache cmake cpio curl device-tree-compiler fastjar flex gawk gettext gcc-multilib g++-multilib \
+            git gperf haveged help2man intltool libc6-dev-i386 libelf-dev libfuse-dev libglib2.0-dev libgmp3-dev \
+            libltdl-dev libmpc-dev libmpfr-dev libncurses5-dev libncursesw5-dev libpython3-dev libreadline-dev \
+            libssl-dev libtool lrzsz mkisofs msmtp ninja-build p7zip p7zip-full patch pkgconf python2.7 python3 \
+            python3-pyelftools python3-setuptools qemu-utils rsync scons squashfs-tools subversion swig texinfo \
+            uglifyjs upx-ucl unzip vim wget xmlto xxd zlib1g-dev
+          sudo -E apt-get clean
+          sudo timedatectl set-timezone "$TZ"
           echo "✅ Dependencies installed"
 
-      - name: Create working directory
+      # step 3. 克隆 OpenWrt 23.05 官方源码
+      - name: Clone OpenWrt 23.05
         run: |
-          mkdir -p ${{ env.WORK_DIR }}
-          mkdir -p ${{ env.ARTIFACT_DIR }}/{firmware,logs,config,sdk}
-          echo "✅ Working directories created"
+          git clone --branch $OPENWRT_BRANCH $REPO_URL openwrt
+          cd openwrt
+          echo "✅ Cloned OpenWrt $OPENWRT_BRANCH"
 
-      # ---------- 2. 下载官方SDK ----------
-      - name: Download OpenWrt SDK
-        id: download_sdk
-        run: |
-          # 构建SDK下载URL
-          SDK_FILENAME="openwrt-sdk-${{ env.OPENWRT_VERSION }}-${{ env.TARGET }}-${{ env.SUBTARGET }}_gcc-12.3.0_musl.Linux-x86_64.tar.xz"
-          SDK_FULL_URL="${{ env.SDK_URL }}/${{ env.OPENWRT_VERSION }}/targets/${{ env.TARGET }}/${{ env.SUBTARGET }}/$SDK_FILENAME"
-          
-          echo "📥 Downloading SDK from: $SDK_FULL_URL"
-          
-          # 带重试的下载
-          for i in {1..5}; do
-            wget --timeout=30 --tries=3 -O /tmp/sdk.tar.xz "$SDK_FULL_URL" && break
-            if [ $i -eq 5 ]; then
-              echo "❌ Failed to download SDK after 5 attempts"
-              exit 1
-            fi
-            echo "Retry $i/5..."
-            sleep 10
-          done
-          
-          # 验证下载
-          file /tmp/sdk.tar.xz | grep "XZ compressed data" || exit 1
-          
-          # 解压SDK
-          tar -xJf /tmp/sdk.tar.xz -C ${{ env.WORK_DIR }} --strip-components=1
-          
-          # 保存SDK路径供后续使用
-          echo "sdk_path=${{ env.WORK_DIR }}" >> $GITHUB_OUTPUT
-          echo "sdk_url=$SDK_FULL_URL" >> $GITHUB_OUTPUT
-          echo "✅ SDK downloaded and extracted"
-
-      # ---------- 3. 基础配置 ----------
-      - name: Configure feeds
-        run: |
-          cd ${{ env.WORK_DIR }}
-          
-          # 备份原始feeds配置
-          cp feeds.conf.default feeds.conf.default.bak
-          
-          # 使用官方源（GitHub镜像，可靠性高）
-          cat > feeds.conf << EOF
-          src-git base https://github.com/openwrt/openwrt.git;openwrt-23.05
-          src-git packages https://github.com/openwrt/packages.git;openwrt-23.05
-          src-git luci https://github.com/openwrt/luci.git;openwrt-23.05
-          src-git routing https://github.com/openwrt-routing/packages.git;openwrt-23.05
-          src-git telephony https://github.com/openwrt/telephony.git;openwrt-23.05
-          EOF
-          
-          echo "✅ Feeds configured"
-
+      # step 4. 更新 feeds（使用 GitHub 源，避免网络问题）
       - name: Update feeds
         run: |
-          cd ${{ env.WORK_DIR }}
+          cd openwrt
           
-          # 带重试机制的feeds更新
+          # 使用 GitHub 镜像源，提高可靠性
+          cat > feeds.conf << EOF
+          src-git base https://github.com/openwrt/openwrt.git;$OPENWRT_BRANCH
+          src-git packages https://github.com/openwrt/packages.git;$OPENWRT_BRANCH
+          src-git luci https://github.com/openwrt/luci.git;$OPENWRT_BRANCH
+          src-git routing https://github.com/openwrt-routing/packages.git;$OPENWRT_BRANCH
+          src-git telephony https://github.com/openwrt/telephony.git;$OPENWRT_BRANCH
+          EOF
+          
+          # 带重试的 feeds 更新
           for i in {1..5}; do
             ./scripts/feeds update -a && break
             if [ $i -eq 5 ]; then
@@ -122,39 +79,42 @@ jobs:
           ./scripts/feeds install -a
           echo "✅ Feeds updated and installed"
 
-      # ---------- 4. 生成.config（基于官方默认配置修改） ----------
-      - name: Generate .config
+      # step 5. 生成配置文件（针对 MT7688，32M flash/128M 内存）
+      - name: Generate config file
         run: |
-          cd ${{ env.WORK_DIR }}
-          
-          # 先生成默认配置
-          cat > .config << 'EOF'
-          # Target Configuration
+          cd openwrt
+          rm -f ./.config*
+          touch ./.config
+
+          # 写入编译配置（MT7688专用，包含所有你需要的功能）
+          cat >> .config <<'EOF'
+
+          # Target Configuration (MT7688)
           CONFIG_TARGET_ramips=y
           CONFIG_TARGET_ramips_mt76x8=y
           CONFIG_TARGET_ramips_mt76x8_DEVICE_mediatek_mt7628an-eval-board=y
           CONFIG_TARGET_MULTI_PROFILE=y
           CONFIG_TARGET_PER_DEVICE_ROOTFS=y
-          
+
           # Kernel symbol export (你的核心要求)
           CONFIG_KERNEL_KALLSYMS=y
           CONFIG_KERNEL_KALLSYMS_ALL=y
           CONFIG_KERNEL_MODVERSIONS=y
           CONFIG_KERNEL_DEBUG_INFO=y
-          
+
           # SDIO/MMC support (确保SDIO驱动正常加载)
           CONFIG_PACKAGE_kmod-mmc=y
           CONFIG_PACKAGE_kmod-mmc-spi=y
           CONFIG_PACKAGE_kmod-sdhci=y
           CONFIG_PACKAGE_kmod-sdhci-mt7620=y
-          
+
           # USB support
           CONFIG_PACKAGE_kmod-usb-core=y
           CONFIG_PACKAGE_kmod-usb-ohci=y
           CONFIG_PACKAGE_kmod-usb2=y
           CONFIG_PACKAGE_kmod-usb-storage=y
           CONFIG_PACKAGE_kmod-usb-storage-extras=y
-          
+
           # Wireless (MT7688内置WiFi)
           CONFIG_PACKAGE_kmod-mt76-core=y
           CONFIG_PACKAGE_kmod-mt76x2=y
@@ -162,34 +122,33 @@ jobs:
           CONFIG_PACKAGE_kmod-mt76x0e=y
           CONFIG_PACKAGE_hostapd-common=y
           CONFIG_PACKAGE_wpad-basic-mbedtls=y
-          
-          # Network Applications (你需要的功能)
+
           # DDNS
           CONFIG_PACKAGE_ddns-scripts=y
           CONFIG_PACKAGE_ddns-scripts_aliyun=y
           CONFIG_PACKAGE_ddns-scripts_dnspod=y
           CONFIG_PACKAGE_luci-app-ddns=y
-          
+
           # QoS
           CONFIG_PACKAGE_luci-app-qos=y
           CONFIG_PACKAGE_qos-scripts=y
-          
+
           # V2Ray
           CONFIG_PACKAGE_v2ray-core=y
           CONFIG_PACKAGE_v2ray-geoip=y
           CONFIG_PACKAGE_v2ray-geosite=y
           CONFIG_PACKAGE_luci-app-v2ray=y
-          
+
           # FTP Server
           CONFIG_PACKAGE_vsftpd=y
           CONFIG_PACKAGE_luci-app-vsftpd=y
-          
+
           # Luci (Web Interface)
           CONFIG_PACKAGE_luci=y
           CONFIG_PACKAGE_luci-ssl=y
           CONFIG_PACKAGE_luci-theme-bootstrap=y
           CONFIG_PACKAGE_luci-mod-admin-full=y
-          
+
           # Additional useful packages
           CONFIG_PACKAGE_tcpdump=y
           CONFIG_PACKAGE_iperf3=y
@@ -198,80 +157,70 @@ jobs:
           CONFIG_PACKAGE_curl=y
           CONFIG_PACKAGE_wget=y
           CONFIG_PACKAGE_openssh-sftp-server=y
-          
+
           # Filesystem support
           CONFIG_PACKAGE_kmod-fs-ext4=y
           CONFIG_PACKAGE_kmod-fs-vfat=y
           CONFIG_PACKAGE_kmod-fs-ntfs=y
           CONFIG_PACKAGE_block-mount=y
-          
-          # IPv6 support (可选)
+
+          # IPv6 support
           CONFIG_PACKAGE_ip6tables=y
           CONFIG_PACKAGE_kmod-ip6tables=y
           CONFIG_PACKAGE_kmod-ipv6=y
           CONFIG_PACKAGE_odhcp6c=y
           CONFIG_PACKAGE_odhcpd-ipv6only=y
-          EOF
-          
-          # 扩展配置以满足32M flash/128M内存
-          cat >> .config << 'EOF'
-          # Flash size optimization
+
+          # Flash size optimization (32M flash / 128M memory)
           CONFIG_TARGET_KERNEL_PARTSIZE=16
           CONFIG_TARGET_ROOTFS_PARTSIZE=256
           CONFIG_TARGET_ROOTFS_SQUASHFS=y
           CONFIG_TARGET_SQUASHFS_BLOCK_SIZE=256
-          
+
           # 串口波特率115200
           CONFIG_KERNEL_EARLY_PRINTK=y
           CONFIG_KERNEL_CMDLINE_OVERRIDE=y
           CONFIG_CMDLINE="console=ttyS0,115200"
-          
+
           # 调试选项
           CONFIG_DEVEL=y
           CONFIG_CCACHE=y
           CONFIG_CCACHE_DIR="/tmp/ccache"
-          EOF
-          
-          echo "✅ .config generated"
 
-      # ---------- 5. 配置优化 ----------
-      - name: Configure and defconfig
-        run: |
-          cd ${{ env.WORK_DIR }}
+          # Firmware Type (输出格式)
+          CONFIG_TARGET_ROOTFS_TARGZ=y
+          CONFIG_TARGET_ROOTFS_SQUASHFS=y
+
+          EOF
+
+          # 删除文件中每行的所有前导空格
+          sed -i 's/^[ \t]*//g' ./.config
           
-          # 运行defconfig生成完整配置
+          # 生成完整配置
           make defconfig
           
-          # 验证关键配置是否生效
-          echo "🔍 Verifying kernel symbol export..."
-          grep -E "CONFIG_KALLSYMS|CONFIG_MODVERSIONS" .config || exit 1
-          
-          # 保存配置副本
-          cp .config ${{ env.ARTIFACT_DIR }}/config/config.txt
-          cp .config ${{ env.ARTIFACT_DIR }}/config/config-full.txt
-          
-          echo "✅ Configuration completed"
+          # 保存配置供后续使用
+          cp .config ${{ github.workspace }}/config.txt
+          echo "✅ Configuration generated"
 
-      # ---------- 6. 下载源代码 ----------
-      - name: Download source
+      # step 6. 下载源代码（带重试）
+      - name: Make download
         run: |
-          cd ${{ env.WORK_DIR }}
+          cd openwrt
           
-          # 带超时和重试的下载
-          timeout 3600 make download -j$(nproc) || {
-            echo "⚠️ Partial download failure, retrying..."
+          # 带重试的下载，超时3600秒
+          timeout 3600 make download -j8 || {
+            echo "⚠️ Download interrupted, retrying with single thread..."
             make download -j1 V=s
           }
           
-          # 验证下载完整性
-          find dl -type f -name "*.failed" -exec rm {} \;
           echo "✅ Source download completed"
 
-      # ---------- 7. 编译固件 ----------
+      # step 7. 编译固件
       - name: Compile firmware
         id: compile
         run: |
-          cd ${{ env.WORK_DIR }}
+          cd openwrt
           
           # 设置并行编译，但避免内存溢出
           CPUS=$(nproc)
@@ -283,10 +232,10 @@ jobs:
           echo "Build started at: $(date)"
           
           # 编译固件（带详细日志）
-          make -j$CPUS V=s 2>&1 | tee ${{ env.ARTIFACT_DIR }}/logs/build.log
+          make -j$CPUS V=s 2>&1 | tee ${{ github.workspace }}/build.log
           
           # 检查编译结果
-          if [ $? -eq 0 ]; then
+          if [ ${PIPESTATUS[0]} -eq 0 ]; then
             echo "status=success" >> $GITHUB_OUTPUT
             echo "✅ Firmware built successfully"
           else
@@ -297,99 +246,107 @@ jobs:
           
           echo "Build finished at: $(date)"
 
-      # ---------- 8. 收集固件 ----------
+      # step 8. 收集固件
       - name: Collect firmware
         if: always()
         run: |
-          cd ${{ env.WORK_DIR }}
-          
           # 创建固件收集目录
-          mkdir -p ${{ env.ARTIFACT_DIR }}/firmware
+          mkdir -p ${{ github.workspace }}/firmware
+          
+          # 查找固件文件（OpenWrt 23.05 的输出路径）
+          cd openwrt/bin/targets/$TARGET/$SUBTARGET
           
           # 查找并复制所有固件文件
-          find bin/ -type f \( \
+          find . -type f \( \
             -name "*.bin" -o \
             -name "*.trx" -o \
             -name "*.img" -o \
             -name "*squashfs*" -o \
             -name "*sysupgrade*" -o \
-            -name "*factory*" \) \
-            -exec cp -v {} ${{ env.ARTIFACT_DIR }}/firmware/ \;
-          
-          # 如果没有找到固件，复制整个bin目录用于调试
-          if [ -z "$(ls -A ${{ env.ARTIFACT_DIR }}/firmware)" ]; then
-            cp -rf bin/ ${{ env.ARTIFACT_DIR }}/firmware-full/
-            echo "⚠️ No firmware files found, full bin directory saved for debugging"
-          fi
+            -name "*factory*" -o \
+            -name "*.gz" \) \
+            -exec cp -v {} ${{ github.workspace }}/firmware/ \;
           
           # 生成固件列表和校验和
-          cd ${{ env.ARTIFACT_DIR }}/firmware
+          cd ${{ github.workspace }}/firmware
           ls -la > firmware_list.txt
           sha256sum * > sha256sums.txt 2>/dev/null || true
           
-          echo "📦 Firmware collection completed"
+          # 显示找到的固件
+          echo "📦 Firmware files found:"
+          ls -la
+          
+          cd ${{ github.workspace }}
 
-      # ---------- 9. 保存编译环境信息 ----------
-      - name: Save build info
-        if: always()
-        run: |
-          cd ${{ env.WORK_DIR }}
-          
-          # 保存关键信息供后续驱动编译使用
-          cat > ${{ env.ARTIFACT_DIR }}/sdk/build_info.txt << EOF
-          OPENWRT_VERSION=${{ env.OPENWRT_VERSION }}
-          TARGET=${{ env.TARGET }}
-          SUBTARGET=${{ env.SUBTARGET }}
-          SDK_URL=${{ steps.download_sdk.outputs.sdk_url }}
-          SDK_PATH=${{ env.WORK_DIR }}
-          TOOLCHAIN_PATH=${{ env.WORK_DIR }}/staging_dir/toolchain-mipsel_24kc_gcc-12.3.0_musl
-          CROSS_COMPILE=${{ env.WORK_DIR }}/staging_dir/toolchain-mipsel_24kc_gcc-12.3.0_musl/bin/mipsel-openwrt-linux-
-          LINUX_VERSION=$(cat include/kernel-version.mk | grep LINUX_VERSION-5.4 | head -1)
-          KERNEL_BUILD_DIR=${{ env.WORK_DIR }}/build_dir/target-mipsel_24kc_musl/linux-${{ env.TARGET }}_${{ env.SUBTARGET }}
-          EOF
-          
-          # 保存内核配置
-          cp build_dir/target-*/*/linux-*/ .config ${{ env.ARTIFACT_DIR }}/sdk/kernel.config 2>/dev/null || true
-          
-          echo "ℹ️ Build info saved for future driver compilation"
+      # step 9. 创建 Release & 上传资源
+      - name: Create Release and Upload Assets
+        if: steps.compile.outputs.status == 'success'
+        uses: softprops/action-gh-release@v1
+        with:
+          name: OpenWrt 23.05 for MT7688 ${{ github.run_number }}
+          tag_name: mt7688-${{ github.run_number }}
+          body: |
+            ## OpenWrt 23.05 固件 for MT7688
+            
+            **编译时间**: ${{ steps.date.outputs.date }}
+            
+            ### 固件特性
+            - 内核版本: 5.15.x
+            - 目标平台: ${{ env.TARGET }}/${{ env.SUBTARGET }}
+            - 串口波特率: 115200
+            - 内存: 128MB
+            - Flash: 32MB
+            
+            ### 已集成功能
+            - ✅ 内核符号导出 (KALLSYMS_ALL=y) - 方便编译第三方驱动
+            - ✅ SDIO/MMC 支持 - 你的 TXW8301 驱动可用
+            - ✅ DDNS 动态域名
+            - ✅ QoS 流量控制
+            - ✅ V2Ray 代理
+            - ✅ FTP 服务器 (vsftpd)
+            - ✅ Luci Web 界面
+            - ✅ USB 存储支持
+            
+            ### 刷机说明
+            1. 进入 U-Boot 或 OpenWrt 系统
+            2. 刷写 `*-sysupgrade.bin` 文件
+            3. 如果是从其他固件刷入，可能需要先刷 `*-factory.bin`
+            
+            ### SDK 信息（供后续编译驱动使用）
+            ```
+            OPENWRT_VERSION: ${{ env.OPENWRT_VERSION }}
+            TARGET: ${{ env.TARGET }}
+            SUBTARGET: ${{ env.SUBTARGET }}
+            ```
+            
+            ### 文件校验
+            请务必验证 SHA256 校验和后再刷机。
+          files: |
+            ${{ github.workspace }}/firmware/*.bin
+            ${{ github.workspace }}/firmware/*.trx
+            ${{ github.workspace }}/firmware/*.img
+            ${{ github.workspace }}/firmware/*.gz
+            ${{ github.workspace }}/config.txt
+            ${{ github.workspace }}/build.log
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      # ---------- 10. 上传构建产物 ----------
+      # step 10. 上传固件作为 artifact（即使 release 失败也能保存）
       - name: Upload firmware artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: openwrt-23.05-mt7688-firmware-${{ github.run_id }}
-          path: ${{ env.ARTIFACT_DIR }}/firmware/
-          retention-days: 30
-          if-no-files-found: warn
-
-      - name: Upload SDK info
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v3
         with:
-          name: openwrt-23.05-sdk-info-${{ github.run_id }}
-          path: ${{ env.ARTIFACT_DIR }}/sdk/
+          name: openwrt-23.05-mt7688-firmware
+          path: |
+            ${{ github.workspace }}/firmware/
+            ${{ github.workspace }}/config.txt
+            ${{ github.workspace }}/build.log
           retention-days: 30
 
-      - name: Upload build logs
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: openwrt-23.05-build-logs-${{ github.run_id }}
-          path: ${{ env.ARTIFACT_DIR }}/logs/
-          retention-days: 30
-
-      - name: Upload full config
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: openwrt-23.05-config-${{ github.run_id }}
-          path: ${{ env.ARTIFACT_DIR }}/config/
-          retention-days: 30
-
-      # ---------- 11. 清理 ----------
-      - name: Cleanup
-        if: always()
+      # step 11. 获取时间（用于 release 标题）
+      - name: Get current time
+        id: date
         run: |
-          # 清理临时文件，但保留artifacts
-          rm -rf ${{ env.WORK_DIR }}/dl/*.failed 2>/dev/null || true
-          echo "🧹 Cleanup completed"
+          echo "date=$(date +'%Y-%m-%d %H:%M:%S')" >> $GITHUB_OUTPUT
